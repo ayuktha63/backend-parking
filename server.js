@@ -7,8 +7,16 @@ const fs = require('fs');
 const app = express();
 
 // ====== USE MONGODB ATLAS HERE ======
-const uri = "mongodb+srv://home:ayuktha%4063@cluster0.yvf4q.mongodb.net/ParkingSystem?retryWrites=true&w=majority&appName=Cluster0";
-const client = new MongoClient(uri);
+const uri = "mongodb+srv://ayuktha:ayuktha%4063@cluster0.yvf4q.mongodb.net/ParkingSystem?retryWrites=true&w=majority&tls=true";
+const client = new MongoClient(uri, {
+    tls: true,
+    tlsAllowInvalidCertificates: false,
+    minDHSize: 1024,
+    useUnifiedTopology: true,
+    retryWrites: true,
+    serverApi: { version: "1" },
+});
+
 // ====================================
 
 app.use(express.json());
