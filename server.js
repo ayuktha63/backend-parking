@@ -5,8 +5,11 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const app = express();
-const uri = "mongodb://localhost:27017";
+
+// ====== USE MONGODB ATLAS HERE ======
+const uri = "mongodb+srv://home:ayuktha%4063@cluster0.yvf4q.mongodb.net/ParkingSystem?retryWrites=true&w=majority&appName=Cluster0";
 const client = new MongoClient(uri);
+// ====================================
 
 app.use(express.json());
 app.use(cors({ origin: '*' }));
@@ -54,16 +57,16 @@ function handleMulterError(err, req, res, next) {
     next();
 }
 
-// Database Connection with Retry
+// ====== CONNECT TO ATLAS DB WITH RETRIES ======
 async function connectDB() {
     let retries = 5;
     while (retries) {
         try {
             await client.connect();
-            console.log("Connected to MongoDB");
-            return client.db("ParkingSystem");
+            console.log("Connected to MongoDB Atlas");
+            return client.db("ParkingSystem");  // use your DB name
         } catch (error) {
-            console.error("MongoDB connection failed:", error);
+            console.error("MongoDB Atlas connection failed:", error);
             retries -= 1;
             if (retries === 0) {
                 console.error("Max retries reached. Exiting...");
@@ -74,9 +77,7 @@ async function connectDB() {
         }
     }
 }
-
 const dbPromise = connectDB();
-
 // --- USER APP ENDPOINTS ---
 
 // User Registration Endpoint
