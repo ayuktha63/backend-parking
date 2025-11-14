@@ -7,7 +7,7 @@ const fs = require('fs');
 const app = express();
 
 // ====== USE MONGODB ATLAS HERE ======
-const uri = "mongodb+srv://ayuktha:ayuktha163@cluster0.yvf4q.mongodb.net/ParkingSystem?retryWrites=true&w=majority&appName=Cluster0";
+const uri = "mongodb+srv://ayukthas:ayuktha163@cluster0.yvf4q.mongodb.net/ParkingSystem?retryWrites=true&w=majority&appName=Cluster0";
 const client = new MongoClient(uri, {
     tls: true,
     tlsAllowInvalidCertificates: false,
