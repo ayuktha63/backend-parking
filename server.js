@@ -147,6 +147,19 @@ app.get('/api/users/profile/:phone', async (req, res) => {
         res.status(500).json({ message: "Server error", error: error.message });
     }
 });
+// Get All Parking Area Owners
+app.get('/api/owner/all', async (req, res) => {
+    const db = await dbPromise;
+
+    try {
+        const owners = await db.collection('register_login').find().toArray();
+
+        res.status(200).json(owners);
+    } catch (error) {
+        console.error("Error fetching all owners:", error);
+        res.status(500).json({ message: "Server error", error: error.message });
+    }
+});
 
 // Update User Profile Endpoint
 app.put('/api/users/profile', async (req, res) => {
