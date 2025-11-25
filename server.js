@@ -12,9 +12,16 @@ const path = require('path');
 
 const app = express();
 
+const axios = require("axios");
+
 app.use(express.json());
 app.use(cors({ origin: '*' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+
+// 🔥 HARD-CODED MSG91 KEYS — replace with yours
+const MSG91_AUTH_KEY = "YOUR_AUTH_KEY_HERE";
+const MSG91_TEMPLATE_ID = "YOUR_TEMPLATE_ID_HERE"; // OTP template
 
 // Force JSON content-type for all responses
 app.use((req, res, next) => {
@@ -40,65 +47,7 @@ function toInt(id) {
    USER APP ENDPOINTS
 ──────────────────────────────────────────────── */
 
-// User Registration Endpoint
-app.post('/api/users/register', async (req, res) => {
-  const { phone, name } = req.body || {};
-  if (!phone) return res.status(400).json({ message: 'phone is required' });
 
-  try {
-    const existing = await pool.query(
-      'SELECT * FROM users WHERE phone=$1 LIMIT 1',
-      [phone]
-    );
-
-    if (existing.rows.length > 0) {
-      return res
-        .status(200)
-        .json({ message: 'User already exists', user: existing.rows[0] });
-    }
-
-    const now = new Date();
-    const result = await pool.query(
-      `INSERT INTO users (phone, name, created_at, updated_at)
-       VALUES ($1,$2,$3,$4)
-       RETURNING *`,
-      [phone, name || 'User', now, now]
-    );
-
-    return res
-      .status(201)
-      .json({ message: 'User registered successfully', user: result.rows[0] });
-  } catch (error) {
-    console.error('Error registering user:', error);
-    // Unique constraint on phone
-    if (error && error.code === '23505') {
-      return res.status(400).json({ message: 'Phone already registered' });
-    }
-    return res.status(500).json({ message: 'Internal Server Error' });
-  }
-});
-
-// User Login Endpoint
-app.post('/api/users/login', async (req, res) => {
-  const { phone } = req.body || {};
-  if (!phone) return res.status(400).json({ message: 'phone is required' });
-
-  try {
-    const result = await pool.query(
-      'SELECT * FROM users WHERE phone=$1 LIMIT 1',
-      [phone]
-    );
-    if (!result.rows.length) {
-      return res
-        .status(404)
-        .json({ message: 'User not found. Please register.' });
-    }
-    return res.status(200).json({ message: 'Login successful', user: result.rows[0] });
-  } catch (error) {
-    console.error('Error logging in user:', error);
-    return res.status(500).json({ message: 'Internal Server Error' });
-  }
-});
 
 // Get User Profile
 app.get('/api/users/profile/:phone', async (req, res) => {
@@ -755,6 +704,80 @@ app.get('/api/owner/bookings', async (req, res) => {
   } catch (error) {
     console.error('Error fetching active booking:', error);
     return res.status(500).json({ message: 'Internal Server Error' });
+  }
+});
+
+app.post("/api/auth/send-otp", async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ message: "phone is required" });
+
+    await axios.post(
+      "https://control.msg91.com/api/v5/otp",
+      {
+        mobile: phone.startsWith("+91") ? phone : `+91${phone}`,
+        template_id: MSG91_TEMPLATE_ID,
+      },
+      {
+        headers: {
+          authkey: MSG91_AUTH_KEY,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    return res.status(200).json({ message: "OTP sent successfully" });
+  } catch (error) {
+    console.error("MSG91 OTP Error:", error?.response?.data || error.message);
+    return res.status(500).json({ message: "Failed to send OTP" });
+  }
+});
+
+/* ───────────────────────────────
+   VERIFY OTP & CREATE/LOGIN USER
+──────────────────────────────── */
+app.post("/api/auth/verify-otp", async (req, res) => {
+  try {
+    const { phone, otp, name } = req.body;
+    if (!phone || !otp)
+      return res.status(400).json({ message: "phone & otp required" });
+
+    const verifyRes = await axios.post(
+      "https://control.msg91.com/api/v5/otp/verify",
+      {
+        mobile: phone.startsWith("+91") ? phone : `+91${phone}`,
+        otp,
+      },
+      {
+        headers: {
+          authkey: MSG91_AUTH_KEY,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    if (!verifyRes.data || verifyRes.data.type !== "success") {
+      return res.status(400).json({ message: "Invalid OTP" });
+    }
+
+    // ✅ User gets created ONLY after correct OTP
+    const now = new Date();
+    const result = await pool.query(
+      `INSERT INTO users (phone, name, created_at, updated_at)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (phone)
+       DO UPDATE SET updated_at=$4
+       RETURNING *`,
+      [phone, name || "User", now, now]
+    );
+
+    return res.status(200).json({
+      message: "OTP verified successfully",
+      user: result.rows[0],
+    });
+  } catch (error) {
+    console.error("MSG91 Verify Error:", error?.response?.data || error.message);
+    return res.status(500).json({ message: "OTP verification failed" });
   }
 });
 
