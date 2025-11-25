@@ -27,7 +27,7 @@ app.use((req, res, next) => {
 // ====== NEON POSTGRES CONNECTION (NO .env) ======
 const pool = new Pool({
   connectionString:
-    'postgresql://neondb_owner:npg_5x4ADLWqziOR@ep-billowing-unit-adv73ayu-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require',
+    'postgresql://neondb_owner:npg_5x4ADLWqziOR@ep-lucky-water-adryg5p6-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require',
 });
 
 // Helper: safe int cast
