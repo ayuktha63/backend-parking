@@ -200,6 +200,66 @@ app.get('/api/parking_areas', async (req, res) => {
     return res.status(500).json({ message: 'Internal Server Error' });
   }
 });
+// Hold a slot temporarily (2–3 min reservation lock)
+app.post('/api/holds', async (req, res) => {
+  try {
+    const { parking_id, slot_number, vehicle_type, phone } = req.body || {};
+    if (!parking_id || !slot_number || !vehicle_type) {
+      return res.status(400).json({
+        message: "parking_id, slot_number & vehicle_type required"
+      });
+    }
+
+    const parkingId = toInt(parking_id);
+    const vType = vehicle_type.toLowerCase();
+
+    // ✅ Check if already booked
+    const booked = await pool.query(
+      `SELECT 1 FROM bookings
+       WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3`,
+      [parkingId, slot_number, vType]
+    );
+    if (booked.rows.length > 0) {
+      return res.status(400).json({ message: "Slot already booked" });
+    }
+
+    // ✅ Check existing valid hold
+    const existingHold = await pool.query(
+      `SELECT 1 FROM slot_holds
+       WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3
+       AND hold_expires_at > NOW()`,
+      [parkingId, slot_number, vType]
+    );
+    if (existingHold.rows.length > 0) {
+      return res.status(400).json({ message: "Slot already held" });
+    }
+
+    // ✅ Create new hold for 2 minutes
+    await pool.query(
+      `INSERT INTO slot_holds
+       (parking_id, slot_number, vehicle_type, phone, hold_expires_at)
+       VALUES ($1,$2,$3,$4,NOW() + INTERVAL '2 minutes')`,
+      [parkingId, slot_number, vType, phone || ""]
+    );
+
+    // ✅ Emit update to both apps
+    io.to(`parking_${parkingId}_${vType}`).emit("slot_update", {
+      parking_id: parkingId,
+      slot_number,
+      vehicle_type: vType,
+      status: "held"
+    });
+
+    return res.status(200).json({
+      message: "Slot temporarily held",
+      slot_number,
+      expires_in_sec: 120
+    });
+  } catch (e) {
+    console.error("Error creating hold:", e);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+});
 
 // Get Parking Area Details by ID for User App
 app.get('/api/parking_areas/:id', async (req, res) => {
@@ -940,12 +1000,12 @@ const io = new Server(server, {
   }
 });
 
+// ✅ WebSocket listeners here
 io.on("connection", (socket) => {
   console.log("✅ WebSocket connected:", socket.id);
 
-  // ✅ Client joins specific parking area (room)
   socket.on("join_parking", ({ parking_id, vehicle_type }) => {
-    const room = `parking_${parking_id}_${vehicle_type}`;
+    const room = `parking_${parking_id}_${vehicle_type.toLowerCase()}`; // ✅ lowercase
     socket.join(room);
     console.log(`✅ ${socket.id} joined ${room}`);
   });
@@ -954,6 +1014,7 @@ io.on("connection", (socket) => {
     console.log("❌ WebSocket disconnected:", socket.id);
   });
 });
+
 
 const PORT = process.env.PORT || 3000;
 // ✅ FROM HERE — Auto cleanup expired holds
@@ -976,7 +1037,8 @@ setInterval(async () => {
   } catch (error) {
     console.error("Hold cleanup failed:", error);
   }
-}, 5000); // runs every 5 sec
+}, 2000);
+
 // ✅ TO HERE
 
 server.listen(PORT, '0.0.0.0', () => {
