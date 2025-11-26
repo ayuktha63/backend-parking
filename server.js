@@ -270,17 +270,32 @@ app.get('/api/parking_areas/:id/slots', async (req, res) => {
       activeBookings.rows.map(b => b.slot_number)
     );
 
-    const allSlots = Array.from({ length: totalSlots }, (_, i) => {
-      const slot_number = i + 1;
-      const is_booked = bookedSlotNumbers.has(slot_number);
-      return {
-        parking_id,
-        slot_number,
-        vehicle_type: vType,
-        is_booked,
-        status: is_booked ? 'booked' : 'available',
-      };
-    });
+    // ✅ FROM HERE — ADD HELD LOGIC
+const activeHolds = await pool.query(
+  `SELECT slot_number FROM slot_holds
+   WHERE parking_id=$1 AND vehicle_type=$2
+   AND hold_expires_at > NOW()`,
+  [parking_id, vType]
+);
+
+const heldSlotNumbers = new Set(activeHolds.rows.map(h => h.slot_number));
+
+const allSlots = Array.from({ length: totalSlots }, (_, i) => {
+  const slot_number = i + 1;
+
+  let status = "available";
+  if (bookedSlotNumbers.has(slot_number)) status = "booked";
+  else if (heldSlotNumbers.has(slot_number)) status = "held";
+
+  return {
+    parking_id,
+    slot_number,
+    vehicle_type: vType,
+    status,
+  };
+});
+// ✅ TO HERE
+
 
     return res.status(200).json(allSlots);
   } catch (error) {
@@ -333,19 +348,27 @@ async function processBooking(req, res) {
         .json({ message: 'Invalid slot_number for the parking area' });
     }
 
-    // Check for active booking
+    // ✅ Check if already booked
     const existingActiveBooking = await pool.query(
-      `SELECT * FROM bookings
+      `SELECT 1 FROM bookings
        WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3`,
       [parkingId, slot_number, vType]
     );
+
     if (existingActiveBooking.rows.length > 0) {
       return res
         .status(400)
         .json({ message: `Slot ${slot_number} is already actively booked.` });
     }
 
-    // HYBRID MODEL: Ensure slot exists
+    // ✅ Remove existing hold for this slot (convert hold → booking)
+    await pool.query(
+      `DELETE FROM slot_holds
+       WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3`,
+      [parkingId, slot_number, vType]
+    );
+
+    // ✅ HYBRID MODEL — ensure slot entry exists
     const slotResult = await pool.query(
       `INSERT INTO slots (parking_id, slot_number, vehicle_type, last_booked_at, created_at, updated_at)
        VALUES ($1,$2,$3,NOW(),NOW(),NOW())
@@ -359,7 +382,7 @@ async function processBooking(req, res) {
     const now = new Date();
     const entryTime = entry_time ? new Date(entry_time) : now;
 
-    // Create booking
+    // ✅ Create confirmed booking
     const bookingResult = await pool.query(
       `INSERT INTO bookings
        (parking_id, slot_id, slot_number, vehicle_type, number_plate, phone,
@@ -381,7 +404,7 @@ async function processBooking(req, res) {
       ]
     );
 
-    // Update parking area counts
+    // ✅ Update parking area counts
     if (vType === 'car') {
       await pool.query(
         `UPDATE parking_areas
@@ -400,24 +423,25 @@ async function processBooking(req, res) {
       );
     }
 
-    // ✅ Notify all users watching this parking area
-io.to(`parking_${parkingId}_${vType}`).emit("slot_update", {
-  parking_id: parkingId,
-  slot_number,
-  vehicle_type: vType,
-  status: "booked"
-});
+    // ✅ Real-time update via WebSocket
+    io.to(`parking_${parkingId}_${vType}`).emit("slot_update", {
+      parking_id: parkingId,
+      slot_number,
+      vehicle_type: vType,
+      status: "booked",
+    });
 
-return res.status(200).json({
-  message: 'Slot booked',
-  booking_id: bookingResult.rows[0].id,
-  slot_number,
-});
-}  catch (error) {
+    return res.status(200).json({
+      message: 'Slot booked successfully',
+      booking_id: bookingResult.rows[0].id,
+      slot_number,
+    });
+  } catch (error) {
     console.error('Error booking slot:', error);
     return res.status(500).json({ message: 'Internal Server Error' });
   }
 }
+
 
 // Book a Slot for User App
 app.post('/api/bookings', processBooking);
@@ -707,17 +731,32 @@ app.get('/api/owner/parking_areas/:id/slots', async (req, res) => {
       activeBookings.rows.map(b => b.slot_number)
     );
 
-    const allSlots = Array.from({ length: totalSlots }, (_, i) => {
-      const slot_number = i + 1;
-      const is_booked = bookedSlotNumbers.has(slot_number);
-      return {
-        parking_id,
-        slot_number,
-        vehicle_type: vType,
-        is_booked,
-        status: is_booked ? 'booked' : 'available',
-      };
-    });
+    // ✅ FROM HERE — ADD HELD LOGIC
+const activeHolds = await pool.query(
+  `SELECT slot_number FROM slot_holds
+   WHERE parking_id=$1 AND vehicle_type=$2
+   AND hold_expires_at > NOW()`,
+  [parking_id, vType]
+);
+
+const heldSlotNumbers = new Set(activeHolds.rows.map(h => h.slot_number));
+
+const allSlots = Array.from({ length: totalSlots }, (_, i) => {
+  const slot_number = i + 1;
+
+  let status = "available";
+  if (bookedSlotNumbers.has(slot_number)) status = "booked";
+  else if (heldSlotNumbers.has(slot_number)) status = "held";
+
+  return {
+    parking_id,
+    slot_number,
+    vehicle_type: vType,
+    status,
+  };
+});
+// ✅ TO HERE
+
 
     return res.status(200).json(allSlots);
   } catch (error) {
@@ -917,7 +956,29 @@ io.on("connection", (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
+// ✅ FROM HERE — Auto cleanup expired holds
+setInterval(async () => {
+  try {
+    const expired = await pool.query(
+      `DELETE FROM slot_holds
+       WHERE hold_expires_at < NOW()
+       RETURNING parking_id, slot_number, vehicle_type`
+    );
+
+    expired.rows.forEach(({ parking_id, slot_number, vehicle_type }) => {
+      io.to(`parking_${parking_id}_${vehicle_type}`).emit("slot_update", {
+        parking_id,
+        slot_number,
+        vehicle_type,
+        status: "available"
+      });
+    });
+  } catch (error) {
+    console.error("Hold cleanup failed:", error);
+  }
+}, 5000); // runs every 5 sec
+// ✅ TO HERE
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server + WebSocket running on http://0.0.0.0:${PORT}`);
 });
-
