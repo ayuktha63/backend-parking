@@ -9,7 +9,8 @@ const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
 const path = require('path');
-
+const http = require('http'); // ✅ NEW
+const { Server } = require('socket.io'); // ✅ NEW
 const app = express();
 
 const axios = require("axios");
@@ -348,12 +349,20 @@ async function processBooking(req, res) {
       );
     }
 
-    return res.status(200).json({
-      message: 'Slot booked',
-      booking_id: bookingResult.rows[0].id,
-      slot_number,
-    });
-  } catch (error) {
+    // ✅ Notify all users watching this parking area
+io.to(`parking_${parkingId}_${vType}`).emit("slot_update", {
+  parking_id: parkingId,
+  slot_number,
+  vehicle_type: vType,
+  status: "booked"
+});
+
+return res.status(200).json({
+  message: 'Slot booked',
+  booking_id: bookingResult.rows[0].id,
+  slot_number,
+});
+}  catch (error) {
     console.error('Error booking slot:', error);
     return res.status(500).json({ message: 'Internal Server Error' });
   }
@@ -870,10 +879,19 @@ app.post('/api/owner/bookings/complete', async (req, res) => {
       );
     }
 
-    return res.status(200).json({
-      message: 'Booking completed and slot freed',
-      amount: finalAmount,
-    });
+    // ✅ Real-time free-slot update
+io.to(`parking_${parkingId}_${vType}`).emit("slot_update", {
+  parking_id: parkingId,
+  slot_number: activeBooking.slot_number,
+  vehicle_type: vType,
+  status: "available"
+});
+
+return res.status(200).json({
+  message: 'Booking completed and slot freed',
+  amount: finalAmount,
+});
+
   } catch (error) {
     console.error('Error completing booking:', error);
     return res.status(500).json({ message: 'Internal Server Error' });
@@ -897,7 +915,31 @@ app.use((err, req, res, next) => {
    START SERVER
 ──────────────────────────────────────────────── */
 
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST'],
+  }
+});
+
+io.on("connection", (socket) => {
+  console.log("✅ WebSocket connected:", socket.id);
+
+  // ✅ Client joins specific parking area (room)
+  socket.on("join_parking", ({ parking_id, vehicle_type }) => {
+    const room = `parking_${parking_id}_${vehicle_type}`;
+    socket.join(room);
+    console.log(`✅ ${socket.id} joined ${room}`);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("❌ WebSocket disconnected:", socket.id);
+  });
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on http://0.0.0.0:${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server + WebSocket running on http://0.0.0.0:${PORT}`);
 });
