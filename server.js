@@ -238,7 +238,7 @@ app.post('/api/holds', async (req, res) => {
     await pool.query(
       `INSERT INTO slot_holds
        (parking_id, slot_number, vehicle_type, phone, hold_expires_at)
-       VALUES ($1,$2,$3,$4,NOW() + INTERVAL '2 minutes')`,
+       VALUES ($1,$2,$3,$4,NOW() + INTERVAL '20 seconds')`,
       [parkingId, slot_number, vType, phone || ""]
     );
 
@@ -253,7 +253,7 @@ app.post('/api/holds', async (req, res) => {
     return res.status(200).json({
       message: "Slot temporarily held",
       slot_number,
-      expires_in_sec: 120
+      expires_in_sec: 20
     });
   } catch (e) {
     console.error("Error creating hold:", e);
