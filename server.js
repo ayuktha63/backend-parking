@@ -342,20 +342,48 @@ const activeHolds = await pool.query(
 
 const heldSlotNumbers = new Set(activeHolds.rows.map(h => h.slot_number));
 
-const allSlots = Array.from({ length: totalSlots }, (_, i) => {
-  const slot_number = i + 1;
+const allSlots = [];
+
+for (let i = 1; i <= totalSlots; i++) {
+  const slot_number = i;
 
   let status = "available";
-  if (bookedSlotNumbers.has(slot_number)) status = "booked";
-  else if (heldSlotNumbers.has(slot_number)) status = "held";
 
-  return {
+  // FETCH EXISTING BOOKING FOR THIS SLOT
+  const existingBooking = await pool.query(
+    `SELECT entry_time FROM bookings
+     WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3
+     LIMIT 1`,
+    [parking_id, slot_number, vType]
+  );
+
+  if (existingBooking.rows.length > 0) {
+    const entry = new Date(existingBooking.rows[0].entry_time);
+
+    // ACTIVE WINDOW CHECK (use seconds in test mode)
+    const existingStart = new Date(entry.getTime() - 10 * 1000);
+    const existingEnd = new Date(entry.getTime() + 10 * 1000);
+
+    const now = new Date();
+
+    if (now >= existingStart && now <= existingEnd) {
+      status = "booked";   // 🚀 Only active window shown as booked
+    }
+  }
+
+  // HELD CHECK (HIGHEST PRIORITY)
+  if (heldSlotNumbers.has(slot_number)) {
+    status = "held";
+  }
+
+  allSlots.push({
     parking_id,
     slot_number,
     vehicle_type: vType,
     status,
-  };
-});
+  });
+}
+
 // ✅ TO HERE
 
 
