@@ -214,14 +214,31 @@ app.post('/api/holds', async (req, res) => {
     const vType = vehicle_type.toLowerCase();
 
     // ✅ Check if already booked
-    const booked = await pool.query(
-      `SELECT 1 FROM bookings
-       WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3`,
-      [parkingId, slot_number, vType]
-    );
-    if (booked.rows.length > 0) {
-      return res.status(400).json({ message: "Slot already booked" });
-    }
+    // Check time-window (only block if inside ±10 min window)
+const booked = await pool.query(
+  `SELECT entry_time FROM bookings 
+   WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3`,
+  [parkingId, slot_number, vType]
+);
+
+let isBlocked = false;
+
+if (booked.rows.length > 0) {
+  const entry = new Date(booked.rows[0].entry_time);
+
+  const existingStart = new Date(entry.getTime() - 10 * 60000);
+  const existingEnd = new Date(entry.getTime() + 10 * 60000);
+  const now = new Date();
+
+  if (now >= existingStart && now <= existingEnd) {
+    isBlocked = true;
+  }
+}
+
+if (isBlocked) {
+  return res.status(400).json({ message: "Slot currently in active window" });
+}
+
 
     // ✅ Check existing valid hold
     const existingHold = await pool.query(
@@ -481,11 +498,6 @@ const existingActiveBooking = await pool.query(
 );
 
 
-    if (existingActiveBooking.rows.length > 0) {
-      return res
-        .status(400)
-        .json({ message: `Slot ${slotNum} is already actively booked.` });
-    }
 
     // Remove existing hold for this slot (convert hold → booking)
     await pool.query(
