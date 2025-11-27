@@ -418,11 +418,40 @@ async function processBooking(req, res) {
     }
 
     // Check if already booked (use slotNum)
-    const existingActiveBooking = await pool.query(
-      `SELECT 1 FROM bookings
-       WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3`,
-      [parkingId, slotNum, vType]
-    );
+    // ⚠️ NEW: TIME OVERLAP CHECK
+// new booking start time
+const newStart = new Date(entry_time);
+const newEnd = new Date(newStart.getTime() + 15 * 60000);  // +15 minutes
+
+// Fetch existing active bookings for this slot
+const conflicts = await pool.query(
+  `SELECT entry_time FROM bookings
+   WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3`,
+  [parkingId, slotNum, vType]
+);
+
+for (const row of conflicts.rows) {
+  const existing = new Date(row.entry_time);
+
+  const existingStart = new Date(existing.getTime() - 10 * 60000); // -10 min
+  const existingEnd = new Date(existing.getTime() + 10 * 60000);   // +10 min
+
+  // Overlap condition
+  if (newStart < existingEnd && newEnd > existingStart) {
+    return res.status(400).json({
+      message: "This slot has a booking near your selected time.",
+      code: "TIME_OVERLAP"
+    });
+  }
+}
+
+// ORIGINAL CHECK
+const existingActiveBooking = await pool.query(
+  `SELECT 1 FROM bookings
+   WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3`,
+  [parkingId, slotNum, vType]
+);
+
 
     if (existingActiveBooking.rows.length > 0) {
       return res
