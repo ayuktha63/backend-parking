@@ -381,11 +381,23 @@ for (let i = 1; i <= totalSlots; i++) {
     const existingStart = new Date(entry.getTime() - 10 * 60000);
     const existingEnd = new Date(entry.getTime() + 10 * 60000);
 
-    const now = new Date();
+    const userEntry = req.query.entry_time ? new Date(req.query.entry_time) : null;
 
-    if (now >= existingStart && now <= existingEnd) {
-      status = "booked";   // 🚀 Only active window shown as booked
+if (userEntry) {
+    const userEnd = new Date(userEntry.getTime() + 15 * 60000);
+
+    // Check overlap
+    if (userEntry < existingEnd && userEnd > existingStart) {
+        status = "booked";
     }
+} else {
+    // Fallback: show booked only if NOW is in buffer
+    const now = new Date();
+    if (now >= existingStart && now <= existingEnd) {
+        status = "booked";
+    }
+}
+
   }
 
   // HELD CHECK (HIGHEST PRIORITY)
