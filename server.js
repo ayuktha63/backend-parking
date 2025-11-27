@@ -521,6 +521,108 @@ async function processBooking(req, res) {
 // Book a Slot for User App
 app.post('/api/bookings', processBooking);
 
+// ===============================================
+// NEW: USER CANCEL BOOKING (Refund Logic)
+// ===============================================
+app.post("/api/bookings/cancel", async (req, res) => {
+  try {
+    const { booking_id, parking_id, vehicle_type } = req.body || {};
+    if (!booking_id || !parking_id || !vehicle_type) {
+      return res.status(400).json({ message: "booking_id, parking_id, and vehicle_type required" });
+    }
+
+    const bookingId = toInt(booking_id);
+    const parkingId = toInt(parking_id);
+    const vType = vehicle_type.toLowerCase();
+
+    // Fetch active booking
+    const bkRes = await pool.query(
+      `SELECT * FROM bookings WHERE id=$1 AND parking_id=$2 AND vehicle_type=$3 LIMIT 1`,
+      [bookingId, parkingId, vType]
+    );
+
+    if (!bkRes.rows.length) {
+      return res.status(404).json({ message: "Active booking not found" });
+    }
+
+    const booking = bkRes.rows[0];
+    const now = new Date();
+    const entryTime = new Date(booking.entry_time);
+    const diffSeconds = Math.floor((entryTime - now) / 1000);
+
+    // Refund Logic
+    let refundPercent = 0;
+    if (diffSeconds > 900 && diffSeconds <= 1800) {  
+  refundPercent = 40;
+}
+
+    const refundAmount = Math.round(((booking.amount || 0) * refundPercent) / 100);
+
+    // Archive into booking_history
+    await pool.query(
+      `INSERT INTO booking_history
+      (booking_id, parking_id, slot_id, slot_number,
+       phone, vehicle_type, number_plate, entry_time,
+       exit_time, payment_id, amount, archived_at,
+       cancelled, cancelled_at, refund_percent)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),true,NOW(),$12)`,
+      [
+        booking.id,
+        booking.parking_id,
+        booking.slot_id,
+        booking.slot_number,
+        booking.phone,
+        booking.vehicle_type,
+        booking.number_plate,
+        booking.entry_time,
+        now,
+        booking.payment_id || "",
+        refundAmount,
+        refundPercent
+      ]
+    );
+
+    // Delete active booking
+    await pool.query(`DELETE FROM bookings WHERE id=$1`, [bookingId]);
+
+    // Update parking count
+    if (vType === "car") {
+      await pool.query(
+        `UPDATE parking_areas
+         SET available_car_slots = available_car_slots + 1,
+             booked_car_slots = booked_car_slots - 1
+         WHERE id=$1`,
+        [parkingId]
+      );
+    } else {
+      await pool.query(
+        `UPDATE parking_areas
+         SET available_bike_slots = available_bike_slots + 1,
+             booked_bike_slots = booked_bike_slots - 1
+         WHERE id=$1`,
+        [parkingId]
+      );
+    }
+
+    // Notify via WebSocket
+    io.to(`parking_${parkingId}_${vType}`).emit("slot_update", {
+      parking_id: parkingId,
+      slot_number: booking.slot_number,
+      vehicle_type: vType,
+      status: "available"
+    });
+
+    return res.status(200).json({
+      message: "Booking cancelled",
+      refund_percent: refundPercent,
+      refund_amount: refundAmount
+    });
+  } catch (e) {
+    console.error("Cancel Booking Error:", e);
+    return res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
 /* ────────────────────────────────────────────────
    OWNER APP ENDPOINTS
 ──────────────────────────────────────────────── */
@@ -976,7 +1078,6 @@ io.to(`parking_${parkingId}_${vType}`).emit("slot_update", {
   slot_number: activeBooking.slot_number,
   vehicle_type: vType,
   status: "available",
-  phone
 });
 
 return res.status(200).json({
@@ -1048,7 +1149,6 @@ setInterval(async () => {
         slot_number,
         vehicle_type,
         status: "available",
-        phone
       });
     });
   } catch (error) {
