@@ -378,8 +378,8 @@ for (let i = 1; i <= totalSlots; i++) {
     const entry = new Date(existingBooking.rows[0].entry_time);
 
     // ACTIVE WINDOW CHECK (use seconds in test mode)
-    const existingStart = new Date(entry.getTime() - 10 * 1000);
-    const existingEnd = new Date(entry.getTime() + 10 * 1000);
+    const existingStart = new Date(entry.getTime() - 10 * 60000);
+    const existingEnd = new Date(entry.getTime() + 10 * 60000);
 
     const now = new Date();
 
