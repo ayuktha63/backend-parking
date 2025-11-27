@@ -377,6 +377,7 @@ async function processBooking(req, res) {
       number_plate,
       entry_time,
       phone,
+      payment_id,
     } = req.body || {};
 
     const parkingId = toInt(parking_id);
