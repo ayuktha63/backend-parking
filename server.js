@@ -247,7 +247,9 @@ app.post('/api/holds', async (req, res) => {
       parking_id: parkingId,
       slot_number,
       vehicle_type: vType,
-      status: "held"
+      status: "held",
+      phone 
+
     });
 
     return res.status(200).json({
@@ -496,6 +498,7 @@ async function processBooking(req, res) {
       slot_number: slotNum,
       vehicle_type: vType,
       status: "booked",
+      phone
     });
 
     // Debug success
@@ -972,7 +975,8 @@ io.to(`parking_${parkingId}_${vType}`).emit("slot_update", {
   parking_id: parkingId,
   slot_number: activeBooking.slot_number,
   vehicle_type: vType,
-  status: "available"
+  status: "available",
+  phone
 });
 
 return res.status(200).json({
@@ -1043,7 +1047,8 @@ setInterval(async () => {
         parking_id,
         slot_number,
         vehicle_type,
-        status: "available"
+        status: "available",
+        phone
       });
     });
   } catch (error) {
