@@ -149,6 +149,68 @@ app.get('/api/parking_areas', async (req, res) => {
     return res.status(500).json({ message: 'Internal Server Error' });
   }
 });
+// Hold a slot temporarily (2–3 min reservation lock)
+app.post('/api/holds', async (req, res) => {
+  try {
+    const { parking_id, slot_number, vehicle_type, phone } = req.body || {};
+    if (!parking_id || !slot_number || !vehicle_type) {
+      return res.status(400).json({
+        message: "parking_id, slot_number & vehicle_type required"
+      });
+    }
+
+    const parkingId = toInt(parking_id);
+    const vType = vehicle_type.toLowerCase();
+
+    // ✅ Check if already booked
+    const booked = await pool.query(
+      `SELECT 1 FROM bookings
+       WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3`,
+      [parkingId, slot_number, vType]
+    );
+    if (booked.rows.length > 0) {
+      return res.status(400).json({ message: "Slot already booked" });
+    }
+
+    // ✅ Check existing valid hold
+    const existingHold = await pool.query(
+      `SELECT 1 FROM slot_holds
+       WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3
+       AND hold_expires_at > NOW()`,
+      [parkingId, slot_number, vType]
+    );
+    if (existingHold.rows.length > 0) {
+      return res.status(400).json({ message: "Slot already held" });
+    }
+
+    // ✅ Create new hold for 2 minutes
+    await pool.query(
+      `INSERT INTO slot_holds
+       (parking_id, slot_number, vehicle_type, phone, hold_expires_at)
+       VALUES ($1,$2,$3,$4,NOW() + INTERVAL '20 seconds')`,
+      [parkingId, slot_number, vType, phone || ""]
+    );
+
+    // ✅ Emit update to both apps
+    io.to(`parking_${parkingId}_${vType}`).emit("slot_update", {
+      parking_id: parkingId,
+      slot_number,
+      vehicle_type: vType,
+      status: "held",
+      phone 
+
+    });
+
+    return res.status(200).json({
+      message: "Slot temporarily held",
+      slot_number,
+      expires_in_sec: 20
+    });
+  } catch (e) {
+    console.error("Error creating hold:", e);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+});
 
 // Get Parking Area Details by ID for User App
 app.get('/api/parking_areas/:id', async (req, res) => {
@@ -219,17 +281,32 @@ app.get('/api/parking_areas/:id/slots', async (req, res) => {
       activeBookings.rows.map(b => b.slot_number)
     );
 
-    const allSlots = Array.from({ length: totalSlots }, (_, i) => {
-      const slot_number = i + 1;
-      const is_booked = bookedSlotNumbers.has(slot_number);
-      return {
-        parking_id,
-        slot_number,
-        vehicle_type: vType,
-        is_booked,
-        status: is_booked ? 'booked' : 'available',
-      };
-    });
+    // ✅ FROM HERE — ADD HELD LOGIC
+const activeHolds = await pool.query(
+  `SELECT slot_number FROM slot_holds
+   WHERE parking_id=$1 AND vehicle_type=$2
+   AND hold_expires_at > NOW()`,
+  [parking_id, vType]
+);
+
+const heldSlotNumbers = new Set(activeHolds.rows.map(h => h.slot_number));
+
+const allSlots = Array.from({ length: totalSlots }, (_, i) => {
+  const slot_number = i + 1;
+
+  let status = "available";
+  if (bookedSlotNumbers.has(slot_number)) status = "booked";
+  else if (heldSlotNumbers.has(slot_number)) status = "held";
+
+  return {
+    parking_id,
+    slot_number,
+    vehicle_type: vType,
+    status,
+  };
+});
+// ✅ TO HERE
+
 
     return res.status(200).json(allSlots);
   } catch (error) {
@@ -251,17 +328,24 @@ async function processBooking(req, res) {
       number_plate,
       entry_time,
       phone,
+      payment_id,
     } = req.body || {};
 
     const parkingId = toInt(parking_id);
+    const slotNum = Number.isInteger(Number(slot_number)) ? parseInt(slot_number, 10) : null;
 
-    if (!parkingId || !slot_number || !vehicle_type) {
+    if (!parkingId || !slotNum || !vehicle_type) {
       return res
         .status(400)
         .json({ message: 'parking_id, slot_number and vehicle_type are required' });
     }
 
     const vType = vehicle_type.toLowerCase();
+
+    // Debugging log (remove in production)
+    console.log('processBooking called:', {
+      parkingId, slotNum, vType, number_plate, entry_time, phone, payment_id
+    });
 
     // Fetch parking area
     const areaResult = await pool.query(
@@ -276,39 +360,47 @@ async function processBooking(req, res) {
     const totalSlotsKey = vType === 'car' ? 'total_car_slots' : 'total_bike_slots';
     const totalSlots = parkingArea[totalSlotsKey];
 
-    if (slot_number > totalSlots || slot_number <= 0) {
+    if (slotNum > totalSlots || slotNum <= 0) {
       return res
         .status(400)
         .json({ message: 'Invalid slot_number for the parking area' });
     }
 
-    // Check for active booking
+    // Check if already booked (use slotNum)
     const existingActiveBooking = await pool.query(
-      `SELECT * FROM bookings
+      `SELECT 1 FROM bookings
        WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3`,
-      [parkingId, slot_number, vType]
+      [parkingId, slotNum, vType]
     );
+
     if (existingActiveBooking.rows.length > 0) {
       return res
         .status(400)
-        .json({ message: `Slot ${slot_number} is already actively booked.` });
+        .json({ message: `Slot ${slotNum} is already actively booked.` });
     }
 
-    // HYBRID MODEL: Ensure slot exists
+    // Remove existing hold for this slot (convert hold → booking)
+    await pool.query(
+      `DELETE FROM slot_holds
+       WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3`,
+      [parkingId, slotNum, vType]
+    );
+
+    // HYBRID MODEL — ensure slot entry exists (use slotNum)
     const slotResult = await pool.query(
       `INSERT INTO slots (parking_id, slot_number, vehicle_type, last_booked_at, created_at, updated_at)
        VALUES ($1,$2,$3,NOW(),NOW(),NOW())
        ON CONFLICT (parking_id,vehicle_type,slot_number)
        DO UPDATE SET last_booked_at=NOW(), updated_at=NOW()
        RETURNING id`,
-      [parkingId, slot_number, vType]
+      [parkingId, slotNum, vType]
     );
     const slotId = slotResult.rows[0].id;
 
     const now = new Date();
     const entryTime = entry_time ? new Date(entry_time) : now;
 
-    // Create booking
+    // Create confirmed booking — IMPORTANT: include payment_id here
     const bookingResult = await pool.query(
       `INSERT INTO bookings
        (parking_id, slot_id, slot_number, vehicle_type, number_plate, phone,
@@ -318,13 +410,13 @@ async function processBooking(req, res) {
       [
         parkingId,
         slotId,
-        slot_number,
+        slotNum,
         vType,
         number_plate || '',
         phone || '',
         entryTime,
         null,
-        '',
+        payment_id || '',   // <<-- PASS payment_id here
         now,
         now,
       ]
@@ -334,7 +426,7 @@ async function processBooking(req, res) {
     if (vType === 'car') {
       await pool.query(
         `UPDATE parking_areas
-         SET available_car_slots = available_car_slots - 1,
+         SET available_car_slots = GREATEST(available_car_slots - 1, 0),
              booked_car_slots = booked_car_slots + 1
          WHERE id=$1`,
         [parkingId]
@@ -342,13 +434,14 @@ async function processBooking(req, res) {
     } else {
       await pool.query(
         `UPDATE parking_areas
-         SET available_bike_slots = available_bike_slots - 1,
+         SET available_bike_slots = GREATEST(available_bike_slots - 1, 0),
              booked_bike_slots = booked_bike_slots + 1
          WHERE id=$1`,
         [parkingId]
       );
     }
 
+<<<<<<< HEAD
     // ✅ Notify all users watching this parking area
 io.to(`parking_${parkingId}_${vType}`).emit("slot_update", {
   parking_id: parkingId,
@@ -363,10 +456,33 @@ return res.status(200).json({
   slot_number,
 });
 }  catch (error) {
+=======
+    // Real-time update via WebSocket
+    io.to(`parking_${parkingId}_${vType}`).emit("slot_update", {
+      parking_id: parkingId,
+      slot_number: slotNum,
+      vehicle_type: vType,
+      status: "booked",
+      phone
+    });
+
+    // Debug success
+    console.log('Booking created id=', bookingResult.rows[0].id);
+
+    return res.status(200).json({
+      message: 'Slot booked successfully',
+      booking_id: bookingResult.rows[0].id,
+      slot_number: slotNum,
+    });
+  } catch (error) {
+>>>>>>> 5b15405263287250e5fe7e27f9b7b9ab9687a8bc
     console.error('Error booking slot:', error);
-    return res.status(500).json({ message: 'Internal Server Error' });
+    // Return the error message in dev mode to help debugging (optional)
+    return res.status(500).json({ message: 'Internal Server Error', error: error.message });
   }
 }
+
+
 
 // Book a Slot for User App
 app.post('/api/bookings', processBooking);
@@ -656,17 +772,32 @@ app.get('/api/owner/parking_areas/:id/slots', async (req, res) => {
       activeBookings.rows.map(b => b.slot_number)
     );
 
-    const allSlots = Array.from({ length: totalSlots }, (_, i) => {
-      const slot_number = i + 1;
-      const is_booked = bookedSlotNumbers.has(slot_number);
-      return {
-        parking_id,
-        slot_number,
-        vehicle_type: vType,
-        is_booked,
-        status: is_booked ? 'booked' : 'available',
-      };
-    });
+    // ✅ FROM HERE — ADD HELD LOGIC
+const activeHolds = await pool.query(
+  `SELECT slot_number FROM slot_holds
+   WHERE parking_id=$1 AND vehicle_type=$2
+   AND hold_expires_at > NOW()`,
+  [parking_id, vType]
+);
+
+const heldSlotNumbers = new Set(activeHolds.rows.map(h => h.slot_number));
+
+const allSlots = Array.from({ length: totalSlots }, (_, i) => {
+  const slot_number = i + 1;
+
+  let status = "available";
+  if (bookedSlotNumbers.has(slot_number)) status = "booked";
+  else if (heldSlotNumbers.has(slot_number)) status = "held";
+
+  return {
+    parking_id,
+    slot_number,
+    vehicle_type: vType,
+    status,
+  };
+});
+// ✅ TO HERE
+
 
     return res.status(200).json(allSlots);
   } catch (error) {
@@ -884,7 +1015,12 @@ io.to(`parking_${parkingId}_${vType}`).emit("slot_update", {
   parking_id: parkingId,
   slot_number: activeBooking.slot_number,
   vehicle_type: vType,
+<<<<<<< HEAD
   status: "available"
+=======
+  status: "available",
+  phone
+>>>>>>> 5b15405263287250e5fe7e27f9b7b9ab9687a8bc
 });
 
 return res.status(200).json({
@@ -922,6 +1058,7 @@ const io = new Server(server, {
     origin: '*',
     methods: ['GET', 'POST'],
   }
+<<<<<<< HEAD
 });
 
 io.on("connection", (socket) => {
@@ -940,6 +1077,54 @@ io.on("connection", (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server + WebSocket running on http://0.0.0.0:${PORT}`);
+=======
+>>>>>>> 5b15405263287250e5fe7e27f9b7b9ab9687a8bc
+});
+
+// ✅ WebSocket listeners here
+io.on("connection", (socket) => {
+  console.log("✅ WebSocket connected:", socket.id);
+
+  socket.on("join_parking", ({ parking_id, vehicle_type }) => {
+    const room = `parking_${parking_id}_${vehicle_type.toLowerCase()}`; // ✅ lowercase
+    socket.join(room);
+    console.log(`✅ ${socket.id} joined ${room}`);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("❌ WebSocket disconnected:", socket.id);
+  });
+});
+
+
+const PORT = process.env.PORT || 3000;
+// ✅ FROM HERE — Auto cleanup expired holds
+setInterval(async () => {
+  try {
+    const expired = await pool.query(
+      `DELETE FROM slot_holds
+       WHERE hold_expires_at < NOW()
+       RETURNING parking_id, slot_number, vehicle_type`
+    );
+
+    expired.rows.forEach(({ parking_id, slot_number, vehicle_type }) => {
+      io.to(`parking_${parking_id}_${vehicle_type}`).emit("slot_update", {
+        parking_id,
+        slot_number,
+        vehicle_type,
+        status: "available",
+        phone
+      });
+    });
+  } catch (error) {
+    console.error("Hold cleanup failed:", error);
+  }
+}, 2000);
+
+// ✅ TO HERE
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server + WebSocket running on http://0.0.0.0:${PORT}`);
 });
