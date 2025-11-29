@@ -9,14 +9,18 @@ const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
 const path = require('path');
+const axios = require("axios");
 const http = require('http'); // ✅ NEW
 const { Server } = require('socket.io'); // ✅ NEW
 const app = express();
-
+const MSG91_AUTHKEY = "479720ASlYGogHXyXJ692aaeabP1";         // <-- paste your MSG91 auth key
+const WA_TEMPLATE_NAME = "transactional";
+const WA_NAMESPACE = "5b1a5f70_3016_4451_8747_6fa69b8b564a";
+const WA_INTEGRATED_NUMBER = "15558692939";
 app.use(express.json());
 app.use(cors({ origin: '*' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
+app.locals.otpStore = {};
 // Force JSON content-type for all responses
 app.use((req, res, next) => {
   if (!res.getHeader('Content-Type')) {
@@ -36,7 +40,97 @@ function toInt(id) {
   const num = Number(id);
   return Number.isInteger(num) ? num : null;
 }
+app.post("/api/auth/send-otp", async (req, res) => {
+  const { phone } = req.body;
 
+  if (!phone) {
+    return res.status(400).json({ message: "Phone is required" });
+  }
+
+  // Generate OTP
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+  // Store OTP temporarily
+  req.app.locals.otpStore[phone] = otp;
+
+  try {
+    const payload = {
+      "integrated_number": WA_INTEGRATED_NUMBER,
+      "content_type": "template",
+      "payload": {
+        "messaging_product": "whatsapp",
+        "type": "template",
+        "template": {
+          "name": WA_TEMPLATE_NAME,
+          "language": {
+            "code": "en",
+            "policy": "deterministic"
+          },
+          "namespace": WA_NAMESPACE,
+          "to_and_components": [
+            {
+              "to": [`91${phone}`],
+              "components": {
+                "body_1": {
+                  "type": "text",
+                  "value": otp   // <-- OTP goes here
+                }
+              }
+            }
+          ]
+        }
+      }
+    };
+
+    await axios.post(
+      "https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/",
+      payload,
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "authkey": MSG91_AUTHKEY
+        }
+      }
+    );
+
+    return res.status(200).json({
+      message: "OTP sent via WhatsApp",
+      debug_otp: otp // REMOVE IN PRODUCTION
+    });
+
+  } catch (error) {
+    console.error("WhatsApp OTP ERROR:", error?.response?.data || error);
+    return res.status(500).json({
+      message: "Failed to send OTP",
+      error: error?.response?.data || error
+    });
+  }
+});
+
+
+// 📌 VERIFY OTP
+app.post("/api/auth/verify-otp", async (req, res) => {
+  const { phone, otp } = req.body;
+
+  if (!phone || !otp)
+    return res.status(400).json({ message: "Phone & OTP required" });
+
+  const store = req.app.locals.otpStore;
+  const realOtp = store[phone];
+
+  if (!realOtp) {
+    return res.status(400).json({ message: "OTP expired or not found" });
+  }
+
+  if (realOtp !== otp) {
+    return res.status(400).json({ message: "Invalid OTP" });
+  }
+
+  // OTP verified → Remove from store
+  delete store[phone];
+
+  return res.status(200).json({ message: "OTP verified successfully" });
+});
 /* ────────────────────────────────────────────────
    USER APP ENDPOINTS
 ──────────────────────────────────────────────── */
