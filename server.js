@@ -9,14 +9,18 @@ const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
 const path = require('path');
+const axios = require("axios");
 const http = require('http'); // ✅ NEW
 const { Server } = require('socket.io'); // ✅ NEW
 const app = express();
-
+const MSG91_AUTHKEY = "479720ASlYGogHXyXJ692aaeabP1";         // <-- paste your MSG91 auth key
+const WA_TEMPLATE_NAME = "transactional";
+const WA_NAMESPACE = "5b1a5f70_3016_4451_8747_6fa69b8b564a";
+const WA_INTEGRATED_NUMBER = "15558692939";
 app.use(express.json());
 app.use(cors({ origin: '*' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
+app.locals.otpStore = {};
 // Force JSON content-type for all responses
 app.use((req, res, next) => {
   if (!res.getHeader('Content-Type')) {
@@ -36,7 +40,97 @@ function toInt(id) {
   const num = Number(id);
   return Number.isInteger(num) ? num : null;
 }
+app.post("/api/auth/send-otp", async (req, res) => {
+  const { phone } = req.body;
 
+  if (!phone) {
+    return res.status(400).json({ message: "Phone is required" });
+  }
+
+  // Generate OTP
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+  // Store OTP temporarily
+  req.app.locals.otpStore[phone] = otp;
+
+  try {
+    const payload = {
+      "integrated_number": WA_INTEGRATED_NUMBER,
+      "content_type": "template",
+      "payload": {
+        "messaging_product": "whatsapp",
+        "type": "template",
+        "template": {
+          "name": WA_TEMPLATE_NAME,
+          "language": {
+            "code": "en",
+            "policy": "deterministic"
+          },
+          "namespace": WA_NAMESPACE,
+          "to_and_components": [
+            {
+              "to": [`91${phone}`],
+              "components": {
+                "body_1": {
+                  "type": "text",
+                  "value": otp   // <-- OTP goes here
+                }
+              }
+            }
+          ]
+        }
+      }
+    };
+
+    await axios.post(
+      "https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/",
+      payload,
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "authkey": MSG91_AUTHKEY
+        }
+      }
+    );
+
+    return res.status(200).json({
+      message: "OTP sent via WhatsApp",
+      debug_otp: otp // REMOVE IN PRODUCTION
+    });
+
+  } catch (error) {
+    console.error("WhatsApp OTP ERROR:", error?.response?.data || error);
+    return res.status(500).json({
+      message: "Failed to send OTP",
+      error: error?.response?.data || error
+    });
+  }
+});
+
+
+// 📌 VERIFY OTP
+app.post("/api/auth/verify-otp", async (req, res) => {
+  const { phone, otp } = req.body;
+
+  if (!phone || !otp)
+    return res.status(400).json({ message: "Phone & OTP required" });
+
+  const store = req.app.locals.otpStore;
+  const realOtp = store[phone];
+
+  if (!realOtp) {
+    return res.status(400).json({ message: "OTP expired or not found" });
+  }
+
+  if (realOtp !== otp) {
+    return res.status(400).json({ message: "Invalid OTP" });
+  }
+
+  // OTP verified → Remove from store
+  delete store[phone];
+
+  return res.status(200).json({ message: "OTP verified successfully" });
+});
 /* ────────────────────────────────────────────────
    USER APP ENDPOINTS
 ──────────────────────────────────────────────── */
@@ -214,14 +308,31 @@ app.post('/api/holds', async (req, res) => {
     const vType = vehicle_type.toLowerCase();
 
     // ✅ Check if already booked
-    const booked = await pool.query(
-      `SELECT 1 FROM bookings
-       WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3`,
-      [parkingId, slot_number, vType]
-    );
-    if (booked.rows.length > 0) {
-      return res.status(400).json({ message: "Slot already booked" });
-    }
+    // Check time-window (only block if inside ±10 min window)
+const booked = await pool.query(
+  `SELECT entry_time FROM bookings 
+   WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3`,
+  [parkingId, slot_number, vType]
+);
+
+let isBlocked = false;
+
+if (booked.rows.length > 0) {
+  const entry = new Date(booked.rows[0].entry_time);
+
+  const existingStart = new Date(entry.getTime() - 10 * 60000);
+  const existingEnd = new Date(entry.getTime() + 10 * 60000);
+  const now = new Date();
+
+  if (now >= existingStart && now <= existingEnd) {
+    isBlocked = true;
+  }
+}
+
+if (isBlocked) {
+  return res.status(400).json({ message: "Slot currently in active window" });
+}
+
 
     // ✅ Check existing valid hold
     const existingHold = await pool.query(
@@ -361,14 +472,26 @@ for (let i = 1; i <= totalSlots; i++) {
     const entry = new Date(existingBooking.rows[0].entry_time);
 
     // ACTIVE WINDOW CHECK (use seconds in test mode)
-    const existingStart = new Date(entry.getTime() - 10 * 1000);
-    const existingEnd = new Date(entry.getTime() + 10 * 1000);
+    const existingStart = new Date(entry.getTime() - 10 * 60000);
+    const existingEnd = new Date(entry.getTime() + 10 * 60000);
 
-    const now = new Date();
+    const userEntry = req.query.entry_time ? new Date(req.query.entry_time) : null;
 
-    if (now >= existingStart && now <= existingEnd) {
-      status = "booked";   // 🚀 Only active window shown as booked
+if (userEntry) {
+    const userEnd = new Date(userEntry.getTime() + 15 * 60000);
+
+    // Check overlap
+    if (userEntry < existingEnd && userEnd > existingStart) {
+        status = "booked";
     }
+} else {
+    // Fallback: show booked only if NOW is in buffer
+    const now = new Date();
+    if (now >= existingStart && now <= existingEnd) {
+        status = "booked";
+    }
+}
+
   }
 
   // HELD CHECK (HIGHEST PRIORITY)
@@ -481,11 +604,6 @@ const existingActiveBooking = await pool.query(
 );
 
 
-    if (existingActiveBooking.rows.length > 0) {
-      return res
-        .status(400)
-        .json({ message: `Slot ${slotNum} is already actively booked.` });
-    }
 
     // Remove existing hold for this slot (convert hold → booking)
     await pool.query(
@@ -509,26 +627,30 @@ const existingActiveBooking = await pool.query(
     const entryTime = entry_time ? new Date(entry_time) : now;
 
     // Create confirmed booking — IMPORTANT: include payment_id here
-    const bookingResult = await pool.query(
-      `INSERT INTO bookings
-       (parking_id, slot_id, slot_number, vehicle_type, number_plate, phone,
-        entry_time, exit_time, payment_id, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-       RETURNING id`,
-      [
-        parkingId,
-        slotId,
-        slotNum,
-        vType,
-        number_plate || '',
-        phone || '',
-        entryTime,
-        null,
-        payment_id || '',   // <<-- PASS payment_id here
-        now,
-        now,
-      ]
-    );
+const bookingAmount = req.body.amount || 0;
+
+const bookingResult = await pool.query(
+  `INSERT INTO bookings
+   (parking_id, slot_id, slot_number, vehicle_type, number_plate, phone,
+    entry_time, exit_time, payment_id, amount, created_at, updated_at)
+   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+   RETURNING id`,
+  [
+    parkingId,
+    slotId,
+    slotNum,
+    vType,
+    number_plate || '',
+    phone || '',
+    entryTime,
+    null,
+    payment_id || '',
+    bookingAmount,     // ⭐ NEW ⭐
+    now,
+    now,
+  ]
+);
+
 
     // Update parking area counts
     if (vType === 'car') {
@@ -585,7 +707,9 @@ app.post("/api/bookings/cancel", async (req, res) => {
   try {
     const { booking_id, parking_id, vehicle_type } = req.body || {};
     if (!booking_id || !parking_id || !vehicle_type) {
-      return res.status(400).json({ message: "booking_id, parking_id, and vehicle_type required" });
+      return res.status(400).json({
+        message: "booking_id, parking_id, and vehicle_type required",
+      });
     }
 
     const bookingId = toInt(booking_id);
@@ -594,7 +718,8 @@ app.post("/api/bookings/cancel", async (req, res) => {
 
     // Fetch active booking
     const bkRes = await pool.query(
-      `SELECT * FROM bookings WHERE id=$1 AND parking_id=$2 AND vehicle_type=$3 LIMIT 1`,
+      `SELECT * FROM bookings
+       WHERE id=$1 AND parking_id=$2 AND vehicle_type=$3 LIMIT 1`,
       [bookingId, parkingId, vType]
     );
 
@@ -605,44 +730,63 @@ app.post("/api/bookings/cancel", async (req, res) => {
     const booking = bkRes.rows[0];
     const now = new Date();
     const entryTime = new Date(booking.entry_time);
+
     const diffSeconds = Math.floor((entryTime - now) / 1000);
 
-    // Refund Logic
+    // Refund slab
     let refundPercent = 0;
-    if (diffSeconds > 900 && diffSeconds <= 1800) {  
-  refundPercent = 40;
-}
+    if (diffSeconds > 3600) refundPercent = 60;
+    else if (diffSeconds > 1800) refundPercent = 40;
+    else if (diffSeconds > 900) refundPercent = 40;
+    else refundPercent = 0;
 
-    const refundAmount = Math.round(((booking.amount || 0) * refundPercent) / 100);
-
-    // Archive into booking_history
-    await pool.query(
-      `INSERT INTO booking_history
-      (booking_id, parking_id, slot_id, slot_number,
-       phone, vehicle_type, number_plate, entry_time,
-       exit_time, payment_id, amount, archived_at,
-       cancelled, cancelled_at, refund_percent)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),true,NOW(),$12)`,
-      [
-        booking.id,
-        booking.parking_id,
-        booking.slot_id,
-        booking.slot_number,
-        booking.phone,
-        booking.vehicle_type,
-        booking.number_plate,
-        booking.entry_time,
-        now,
-        booking.payment_id || "",
-        refundAmount,
-        refundPercent
-      ]
+    const refundAmount = Math.round(
+      ((booking.amount || 0) * refundPercent) / 100
     );
 
-    // Delete active booking
+    // Razorpay refund (optional)
+    let razorRefund = null;
+    if (refundAmount > 0 && booking.payment_id) {
+      try {
+        razorRefund = await razorpay.payments.refund(booking.payment_id, {
+          amount: refundAmount,
+        });
+      } catch (e) {
+        console.error("Razorpay refund error:", e);
+      }
+    }
+
+    // Archive into history (map VALUES EXACTLY)
+    await pool.query(
+  `INSERT INTO booking_history
+  (booking_id, parking_id, slot_id, slot_number,
+   phone, vehicle_type, number_plate, entry_time,
+   exit_time, payment_id, amount, archived_at,
+   cancelled, cancelled_at, refund_percent, refund_amount)
+  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),true,NOW(),$12,$13)`,
+  [
+    booking.id,               // $1
+    booking.parking_id,       // $2
+    booking.slot_id,          // $3
+    booking.slot_number,      // $4
+    booking.phone,            // $5
+    booking.vehicle_type,     // $6
+    booking.number_plate,     // $7
+    booking.entry_time,       // $8
+    now,                      // $9 exit_time
+    booking.payment_id || "", // $10
+    booking.amount || 0,      // $11 amount
+    refundPercent,            // $12 refund_percent
+    refundAmount              // $13 refund_amount
+  ]
+);
+
+
+
+    // Delete booking
     await pool.query(`DELETE FROM bookings WHERE id=$1`, [bookingId]);
 
-    // Update parking count
+    // Update slot counters
     if (vType === "car") {
       await pool.query(
         `UPDATE parking_areas
@@ -661,24 +805,26 @@ app.post("/api/bookings/cancel", async (req, res) => {
       );
     }
 
-    // Notify via WebSocket
+    // WebSocket notify
     io.to(`parking_${parkingId}_${vType}`).emit("slot_update", {
       parking_id: parkingId,
       slot_number: booking.slot_number,
       vehicle_type: vType,
-      status: "available"
+      status: "available",
     });
 
     return res.status(200).json({
       message: "Booking cancelled",
       refund_percent: refundPercent,
-      refund_amount: refundAmount
+      refund_amount: refundAmount,
+      razorpay_refund: razorRefund,
     });
   } catch (e) {
     console.error("Cancel Booking Error:", e);
     return res.status(500).json({ message: "Internal Server Error" });
   }
 });
+
 
 /* ────────────────────────────────────────────────
    OWNER APP ENDPOINTS
