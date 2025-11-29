@@ -468,31 +468,34 @@ for (let i = 1; i <= totalSlots; i++) {
     [parking_id, slot_number, vType]
   );
 
-  if (existingBooking.rows.length > 0) {
-    const entry = new Date(existingBooking.rows[0].entry_time);
+if (existingBooking.rows.length > 0) {
+  const bookingEntry = new Date(existingBooking.rows[0].entry_time);
+  const now = new Date();
 
-    // ACTIVE WINDOW CHECK (use seconds in test mode)
-    const existingStart = new Date(entry.getTime() - 10 * 60000);
-    const existingEnd = new Date(entry.getTime() + 10 * 60000);
+  const userEntry = req.query.entry_time
+    ? new Date(req.query.entry_time)
+    : null;
 
-    const userEntry = req.query.entry_time ? new Date(req.query.entry_time) : null;
+  // A slot is booked ONLY IF:
+  // 1) The user-selected entry time is within ±10 minutes of the booking
+  // OR
+  // 2) The current time is within ±10 minutes of booking (live view)
 
-if (userEntry) {
-    const userEnd = new Date(userEntry.getTime() + 15 * 60000);
+  const BUFFER = 10; // minutes
 
-    // Check overlap
-    if (userEntry < existingEnd && userEnd > existingStart) {
-        status = "booked";
+  if (userEntry) {
+    const diff = Math.abs(bookingEntry - userEntry) / 60000;
+    if (diff <= BUFFER) {
+      status = "booked";
     }
-} else {
-    // Fallback: show booked only if NOW is in buffer
-    const now = new Date();
-    if (now >= existingStart && now <= existingEnd) {
-        status = "booked";
+  } else {
+    const diffNow = Math.abs(bookingEntry - now) / 60000;
+    if (diffNow <= BUFFER) {
+      status = "booked";
     }
+  }
 }
 
-  }
 
   // HELD CHECK (HIGHEST PRIORITY)
   if (heldSlotNumbers.has(slot_number)) {
