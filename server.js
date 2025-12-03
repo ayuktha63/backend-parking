@@ -619,45 +619,104 @@ app.post('/api/owner/bookings', processBooking);
 
 // -------------------- Verify booking (payment callback) --------------------
 // Call this when payment succeeds to mark booking verified and update counts if not already
+// -------------------- Verify booking (with pending window logic) --------------------
 app.post('/api/bookings/verify', async (req, res) => {
   try {
     const { booking_id, payment_id, amount } = req.body || {};
-    if (!booking_id || !payment_id) return res.status(400).json({ message: 'booking_id and payment_id required' });
+    if (!booking_id || !payment_id) {
+      return res.status(400).json({ message: 'booking_id and payment_id required' });
+    }
 
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
-      const bRes = await client.query('SELECT * FROM bookings WHERE id=$1 LIMIT 1 FOR UPDATE', [booking_id]);
-      if (!bRes.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Booking not found' }); }
+      const bRes = await client.query(
+        `SELECT * FROM bookings WHERE id=$1 LIMIT 1 FOR UPDATE`,
+        [booking_id]
+      );
 
-      const booking = bRes.rows[0];
-      if (booking.is_verified) {
-        // already verified — update payment_id if necessary
-        await client.query('UPDATE bookings SET payment_id=$1, amount=$2, verified_at=NOW(), updated_at=NOW() WHERE id=$3', [payment_id, amount || booking.amount || 0, booking_id]);
-        await client.query('COMMIT');
-        return res.status(200).json({ message: 'Booking already verified (updated payment info)' });
+      if (!bRes.rows.length) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ message: 'Booking not found' });
       }
 
-      // mark verified and update counts
-      await client.query('UPDATE bookings SET is_verified=true, payment_id=$1, amount=$2, verified_at=NOW(), updated_at=NOW() WHERE id=$3', [payment_id, amount || booking.amount || 0, booking_id]);
+      const booking = bRes.rows[0];
 
-      // Update parking area counts now (verified bookings only adjust counts)
+      // ---------------------------
+      // PERFECT PENDING WINDOW LOGIC
+      // ---------------------------
+
+      const entryTime = new Date(booking.entry_time);
+      const now = new Date();
+
+      const bufferMs = BUFFER_MINUTES * 60 * 1000;
+
+      const windowStart = new Date(entryTime.getTime() - bufferMs); // e.g., 9:45
+      const windowEnd   = new Date(entryTime.getTime() + bufferMs); // e.g., 10:10
+
+      // 1. Too Early
+      if (now < windowStart) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          message: "Verification too early. User hasn't reached the allowed verification window yet.",
+          allowed_from: windowStart,
+          entry_time: entryTime
+        });
+      }
+
+      // 2. Too Late
+      if (now > windowEnd) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          message: "Verification window expired. User did not arrive within the grace period.",
+          expired_at: windowEnd
+        });
+      }
+
+      // 3. If ALREADY Verified → Just update payment info
+      if (booking.is_verified) {
+        await client.query(
+          `UPDATE bookings 
+           SET payment_id=$1, amount=$2, verified_at=NOW(), updated_at=NOW()
+           WHERE id=$3`,
+          [payment_id, amount || booking.amount || 0, booking_id]
+        );
+
+        await client.query('COMMIT');
+        return res.status(200).json({ message: 'Booking already verified (payment updated)' });
+      }
+
+      // 4. VALID VERIFICATION
+      await client.query(
+        `UPDATE bookings 
+         SET is_verified=true, payment_id=$1, amount=$2, verified_at=NOW(), updated_at=NOW()
+         WHERE id=$3`,
+        [payment_id, amount || booking.amount || 0, booking_id]
+      );
+
+      // Update parking slot counts ONLY for verified bookings
       if (booking.vehicle_type === 'car') {
         await client.query(
-          `UPDATE parking_areas SET available_car_slots = GREATEST(available_car_slots - 1, 0), booked_car_slots = booked_car_slots + 1 WHERE id=$1`,
+          `UPDATE parking_areas
+           SET available_car_slots = GREATEST(available_car_slots - 1, 0),
+               booked_car_slots = booked_car_slots + 1
+           WHERE id=$1`,
           [booking.parking_id]
         );
       } else {
         await client.query(
-          `UPDATE parking_areas SET available_bike_slots = GREATEST(available_bike_slots - 1, 0), booked_bike_slots = booked_bike_slots + 1 WHERE id=$1`,
+          `UPDATE parking_areas
+           SET available_bike_slots = GREATEST(available_bike_slots - 1, 0),
+               booked_bike_slots = booked_bike_slots + 1
+           WHERE id=$1`,
           [booking.parking_id]
         );
       }
 
       await client.query('COMMIT');
 
-      // Emit websocket
+      // Broadcast socket update
       io.to(`parking_${booking.parking_id}_${booking.vehicle_type}`).emit("slot_update", {
         parking_id: booking.parking_id,
         slot_number: booking.slot_number,
@@ -666,19 +725,25 @@ app.post('/api/bookings/verify', async (req, res) => {
         phone: booking.phone
       });
 
-      return res.status(200).json({ message: 'Booking verified and counts updated' });
+      return res.status(200).json({
+        message: 'Booking verified successfully',
+        verified_at: now
+      });
+
     } catch (err2) {
-      try { await client.query('ROLLBACK'); } catch (e) {}
-      console.error('Error verifying booking:', err2);
-      return res.status(500).json({ message: 'Failed to verify booking', error: String(err2) });
+      try { await client.query('ROLLBACK'); } catch (_) {}
+      console.error('Verification Error:', err2);
+      return res.status(500).json({ message: 'Verification failed', error: String(err2) });
     } finally {
       client.release();
     }
+
   } catch (err) {
     console.error('Verify booking outer error:', err);
     return res.status(500).json({ message: 'Internal Server Error' });
   }
 });
+
 
 // -------------------- Cancel booking --------------------
 app.post("/api/bookings/cancel", async (req, res) => {
