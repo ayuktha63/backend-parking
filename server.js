@@ -933,36 +933,69 @@ app.get('/api/owner/parking_areas/:id/slots', async (req, res) => {
   try {
     const parking_id = toInt(req.params.id);
     if (!parking_id) return res.status(400).json({ message: 'Invalid parking area ID' });
+
     const { vehicle_type } = req.query || {};
-    if (!vehicle_type || !['car', 'bike'].includes(vehicle_type.toLowerCase())) return res.status(400).json({ message: 'Valid vehicle_type query param required' });
+    if (!vehicle_type || !['car', 'bike'].includes(vehicle_type.toLowerCase()))
+      return res.status(400).json({ message: 'Valid vehicle_type query param required' });
+
     const vType = normalizeVehicleType(vehicle_type);
 
     const areaResult = await pool.query('SELECT * FROM parking_areas WHERE id=$1', [parking_id]);
-    if (!areaResult.rows.length) return res.status(404).json({ message: 'Parking area not found' });
+    if (!areaResult.rows.length)
+      return res.status(404).json({ message: 'Parking area not found' });
+
     const parkingArea = areaResult.rows[0];
-    const totalSlots = vType === 'car' ? parkingArea.total_car_slots : parkingArea.total_bike_slots;
+    const totalSlots =
+      vType === 'car'
+        ? parkingArea.total_car_slots
+        : parkingArea.total_bike_slots;
+
     if (!totalSlots || totalSlots === 0) return res.status(200).json([]);
 
-    const bookingsRes = await pool.query('SELECT slot_number, is_verified FROM bookings WHERE parking_id=$1 AND vehicle_type=$2', [parking_id, vType]);
-    const bookedSlotNumbers = new Set(bookingsRes.rows.map(b => b.slot_number));
+    // Fetch bookings
+    const bookingsRes = await pool.query(
+      `SELECT slot_number, is_verified
+       FROM bookings 
+       WHERE parking_id=$1 AND vehicle_type=$2`,
+      [parking_id, vType]
+    );
 
-    const holdsRes = await pool.query(`SELECT slot_number FROM slot_holds WHERE parking_id=$1 AND vehicle_type=$2 AND hold_expires_at > NOW()`, [parking_id, vType]);
+    // Fetch holds
+    const holdsRes = await pool.query(
+      `SELECT slot_number 
+       FROM slot_holds 
+       WHERE parking_id=$1 AND vehicle_type=$2 AND hold_expires_at > NOW()`,
+      [parking_id, vType]
+    );
+
+    const pendingSlots = new Set();
+    const bookedSlots = new Set();
     const heldSlotNumbers = new Set(holdsRes.rows.map(h => h.slot_number));
+
+    for (const row of bookingsRes.rows) {
+      if (row.is_verified) bookedSlots.add(row.slot_number);
+      else pendingSlots.add(row.slot_number);
+    }
 
     const allSlots = Array.from({ length: totalSlots }, (_, i) => {
       const slot_number = i + 1;
       let status = 'available';
-      if (bookedSlotNumbers.has(slot_number)) status = 'booked';
-      else if (heldSlotNumbers.has(slot_number)) status = 'held';
+
+      if (heldSlotNumbers.has(slot_number)) status = 'held';
+      else if (pendingSlots.has(slot_number)) status = 'pending';
+      else if (bookedSlots.has(slot_number)) status = 'booked';
+
       return { parking_id, slot_number, vehicle_type: vType, status };
     });
 
     return res.status(200).json(allSlots);
+
   } catch (e) {
     console.error('Error fetching owner slots:', e);
     return res.status(500).json({ message: 'Internal Server Error' });
   }
 });
+
 
 // Owner get booking details
 app.get('/api/owner/bookings', async (req, res) => {
