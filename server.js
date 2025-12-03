@@ -620,9 +620,12 @@ app.post('/api/owner/bookings', processBooking);
 // -------------------- Verify booking (payment callback) --------------------
 // Call this when payment succeeds to mark booking verified and update counts if not already
 // -------------------- Verify booking (with pending window logic) --------------------
+// -------------------- Verify booking (FIXED: REMOVED STRICT TIME WINDOWS) --------------------
 app.post('/api/bookings/verify', async (req, res) => {
   try {
     const { booking_id, payment_id, amount } = req.body || {};
+    
+    // Basic Validation
     if (!booking_id || !payment_id) {
       return res.status(400).json({ message: 'booking_id and payment_id required' });
     }
@@ -631,6 +634,7 @@ app.post('/api/bookings/verify', async (req, res) => {
     try {
       await client.query('BEGIN');
 
+      // Lock the booking row
       const bRes = await client.query(
         `SELECT * FROM bookings WHERE id=$1 LIMIT 1 FOR UPDATE`,
         [booking_id]
@@ -642,43 +646,17 @@ app.post('/api/bookings/verify', async (req, res) => {
       }
 
       const booking = bRes.rows[0];
-
-      // ---------------------------
-      // PERFECT PENDING WINDOW LOGIC
-      // ---------------------------
-
-      const entryTime = new Date(booking.entry_time);
       const now = new Date();
 
-      const bufferMs = BUFFER_MINUTES * 60 * 1000;
+      // --- LOGIC CHANGE: REMOVED STRICT TIME WINDOW CHECKS ---
+      // Previously, if user arrived 11 mins late, verification failed. 
+      // Now, we allow the owner to verify at any time as long as the booking exists.
 
-      const windowStart = new Date(entryTime.getTime() - bufferMs); // e.g., 9:45
-      const windowEnd   = new Date(entryTime.getTime() + bufferMs); // e.g., 10:10
-
-      // 1. Too Early
-      if (now < windowStart) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({
-          message: "Verification too early. User hasn't reached the allowed verification window yet.",
-          allowed_from: windowStart,
-          entry_time: entryTime
-        });
-      }
-
-      // 2. Too Late
-      if (now > windowEnd) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({
-          message: "Verification window expired. User did not arrive within the grace period.",
-          expired_at: windowEnd
-        });
-      }
-
-      // 3. If ALREADY Verified → Just update payment info
+      // 1. If ALREADY Verified → Just update payment info/amount
       if (booking.is_verified) {
         await client.query(
           `UPDATE bookings 
-           SET payment_id=$1, amount=$2, verified_at=NOW(), updated_at=NOW()
+           SET payment_id=$1, amount=$2, updated_at=NOW()
            WHERE id=$3`,
           [payment_id, amount || booking.amount || 0, booking_id]
         );
@@ -687,7 +665,7 @@ app.post('/api/bookings/verify', async (req, res) => {
         return res.status(200).json({ message: 'Booking already verified (payment updated)' });
       }
 
-      // 4. VALID VERIFICATION
+      // 2. Perform Verification (Mark True)
       await client.query(
         `UPDATE bookings 
          SET is_verified=true, payment_id=$1, amount=$2, verified_at=NOW(), updated_at=NOW()
@@ -695,7 +673,7 @@ app.post('/api/bookings/verify', async (req, res) => {
         [payment_id, amount || booking.amount || 0, booking_id]
       );
 
-      // Update parking slot counts ONLY for verified bookings
+      // 3. Update parking slot counts (counts track VERIFIED bookings only)
       if (booking.vehicle_type === 'car') {
         await client.query(
           `UPDATE parking_areas
@@ -716,7 +694,7 @@ app.post('/api/bookings/verify', async (req, res) => {
 
       await client.query('COMMIT');
 
-      // Broadcast socket update
+      // 4. Broadcast socket update so UI turns RED immediately
       io.to(`parking_${booking.parking_id}_${booking.vehicle_type}`).emit("slot_update", {
         parking_id: booking.parking_id,
         slot_number: booking.slot_number,
@@ -732,7 +710,7 @@ app.post('/api/bookings/verify', async (req, res) => {
 
     } catch (err2) {
       try { await client.query('ROLLBACK'); } catch (_) {}
-      console.error('Verification Error:', err2);
+      console.error('Verification SQL Error:', err2);
       return res.status(500).json({ message: 'Verification failed', error: String(err2) });
     } finally {
       client.release();
@@ -743,7 +721,6 @@ app.post('/api/bookings/verify', async (req, res) => {
     return res.status(500).json({ message: 'Internal Server Error' });
   }
 });
-
 
 // -------------------- Cancel booking --------------------
 app.post("/api/bookings/cancel", async (req, res) => {
