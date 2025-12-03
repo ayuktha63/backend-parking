@@ -1,15 +1,6 @@
 // server.js — Final (Postgres / Neon) — Hybrid Slot Model + Hold/Verify Flow
-// Features implemented:
-// - HOLD (2 minutes, owned) > VERIFIED booking > UNVERIFIED booking > AVAILABLE
-// - Single overlap logic used everywhere
-// - Transactional booking creation (SELECT ... FOR UPDATE)
-// - Optimize slots queries (fetch bookings & holds once per request)
-// - Unverified bookings (is_verified=false) + /api/bookings/verify to confirm payment
-// - Counts updated ONLY for verified bookings
-// - Hold ownership enforced when converting to booking
-// - Booking history with additional metadata
-// - Cleanup tasks: expired holds + stale unverified bookings
-// - WebSocket updates for slot state changes
+// FIXED: Removed strict time blocking for verification. 
+// Now, if an Owner clicks Verify, it ALWAYS succeeds (Time mismatch logs warning only).
 
 const express = require('express');
 const { Pool } = require('pg');
@@ -617,11 +608,10 @@ async function processBooking(req, res) {
 app.post('/api/bookings', processBooking);
 app.post('/api/owner/bookings', processBooking);
 
-// -------------------- Verify booking (payment callback) --------------------
-// Call this when payment succeeds to mark booking verified and update counts if not already
-// -------------------- Verify booking (with pending window logic) --------------------
-// -------------------- Verify booking (FIXED: REMOVED STRICT TIME WINDOWS) --------------------
-// -------------------- Verify booking (owner must verify during buffer window) --------------------
+// -------------------- Verify booking (FIXED: RELAXED TIME CHECK) --------------------
+// We remove the manual +5.5 hours calculation logic.
+// We remove the strict return 400.
+// We just log if it's outside the window, but allow the update to happen.
 app.post('/api/bookings/verify', async (req, res) => {
   console.log("\n====== 🔍 VERIFY BOOKING ENDPOINT HIT ======");
   console.log("Request Body:", req.body);
@@ -653,19 +643,12 @@ app.post('/api/bookings/verify', async (req, res) => {
 
       const booking = bRes.rows[0];
 
+      // --- TIME WINDOW CHECK (RELAXED) ---
+      // We just parse the time normally. No manual +5.5h math.
       console.log("🔍 Booking entry_time raw:", booking.entry_time);
-
-      // Convert UTC entry_time → IST
-const entryUTC = new Date(booking.entry_time);
-const entryIST = new Date(entryUTC.getTime() + (5.5 * 60 * 60 * 1000));
-
-const entryTime = entryIST;
-
-      console.log("Parsed entryTime:", entryTime);
-
+      const entryTime = booking.entry_time ? new Date(booking.entry_time) : null;
       const { start, end } = windowFromTime(entryTime, BUFFER_MINUTES);
-      const now = new Date(Date.now() + (5.5 * 60 * 60 * 1000));
-
+      const now = new Date();
 
       console.log("Now:", now);
       console.log("Window Start:", start);
@@ -673,16 +656,12 @@ const entryTime = entryIST;
       console.log("Inside window? -->", now >= start && now <= end);
 
       if (!(now >= start && now <= end)) {
-        console.log("❌ Verification outside window");
-        return res.status(400).json({
-          message: 'Verification failed: outside verification window',
-          now,
-          window_start: start,
-          window_end: end
-        });
+        // !!! FIX: We LOG the mismatch but DO NOT RETURN 400.
+        // This accepts the verification even if there is a timezone mismatch.
+        console.warn("⚠️ Verification outside window (likely Timezone drift) - ALLOWING for Owner");
       }
 
-      console.log("✅ Inside window → verifying booking");
+      console.log("✅ Proceeding to verify booking");
 
       await client.query(
         `UPDATE bookings
