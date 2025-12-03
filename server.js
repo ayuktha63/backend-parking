@@ -646,7 +646,8 @@ app.post('/api/bookings/verify', async (req, res) => {
       // --- TIME WINDOW CHECK (RELAXED) ---
       // We just parse the time normally. No manual +5.5h math.
       console.log("🔍 Booking entry_time raw:", booking.entry_time);
-      const entryTime = booking.entry_time ? new Date(booking.entry_time) : null;
+     const entryTime = booking.entry_time ? new Date(booking.entry_time + "Z") : null;
+
       const { start, end } = windowFromTime(entryTime, BUFFER_MINUTES);
       const now = new Date();
 
