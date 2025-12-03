@@ -523,7 +523,7 @@ async function processBooking(req, res) {
     }
 
     // Decide is_verified based on presence of payment_id
-    const isVerified = !!(payment_id);
+    const isVerified = false; 
 
     // Insert booking (unverified if no payment_id)
     const insertBookingRes = await client.query(
