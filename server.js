@@ -655,11 +655,17 @@ app.post('/api/bookings/verify', async (req, res) => {
 
       console.log("🔍 Booking entry_time raw:", booking.entry_time);
 
-      const entryTime = booking.entry_time ? new Date(booking.entry_time) : null;
+      // Convert UTC entry_time → IST
+const entryUTC = new Date(booking.entry_time);
+const entryIST = new Date(entryUTC.getTime() + (5.5 * 60 * 60 * 1000));
+
+const entryTime = entryIST;
+
       console.log("Parsed entryTime:", entryTime);
 
       const { start, end } = windowFromTime(entryTime, BUFFER_MINUTES);
-      const now = new Date();
+      const now = new Date(Date.now() + (5.5 * 60 * 60 * 1000));
+
 
       console.log("Now:", now);
       console.log("Window Start:", start);
