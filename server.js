@@ -621,20 +621,21 @@ app.post('/api/owner/bookings', processBooking);
 // Call this when payment succeeds to mark booking verified and update counts if not already
 // -------------------- Verify booking (with pending window logic) --------------------
 // -------------------- Verify booking (FIXED: REMOVED STRICT TIME WINDOWS) --------------------
+// -------------------- Verify booking (owner must verify during buffer window) --------------------
 app.post('/api/bookings/verify', async (req, res) => {
   try {
     const { booking_id, payment_id, amount } = req.body || {};
-    
-    // Basic Validation
-    if (!booking_id || !payment_id) {
-      return res.status(400).json({ message: 'booking_id and payment_id required' });
+
+    if (!booking_id) {
+      return res.status(400).json({ message: 'booking_id required' });
     }
 
+    // payment_id may be 'owner_confirm' when owner just confirms (that's okay).
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
-      // Lock the booking row
+      // Lock booking row
       const bRes = await client.query(
         `SELECT * FROM bookings WHERE id=$1 LIMIT 1 FOR UPDATE`,
         [booking_id]
@@ -646,34 +647,66 @@ app.post('/api/bookings/verify', async (req, res) => {
       }
 
       const booking = bRes.rows[0];
-      const now = new Date();
 
-      // --- LOGIC CHANGE: REMOVED STRICT TIME WINDOW CHECKS ---
-      // Previously, if user arrived 11 mins late, verification failed. 
-      // Now, we allow the owner to verify at any time as long as the booking exists.
-
-      // 1. If ALREADY Verified → Just update payment info/amount
+      // If already verified, just update payment info if provided and return success
       if (booking.is_verified) {
-        await client.query(
-          `UPDATE bookings 
-           SET payment_id=$1, amount=$2, updated_at=NOW()
-           WHERE id=$3`,
-          [payment_id, amount || booking.amount || 0, booking_id]
-        );
-
+        if (payment_id) {
+          await client.query(
+            `UPDATE bookings SET payment_id=$1, amount=$2, updated_at=NOW() WHERE id=$3`,
+            [payment_id, amount ?? booking.amount ?? 0, booking_id]
+          );
+        }
         await client.query('COMMIT');
         return res.status(200).json({ message: 'Booking already verified (payment updated)' });
       }
 
-      // 2. Perform Verification (Mark True)
+      // Determine booking verification window based on entry_time + BUFFER_MINUTES
+      // windowFromTime exists above in your code
+      const entryTime = booking.entry_time ? new Date(booking.entry_time) : null;
+      if (!entryTime) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'Invalid booking entry_time' });
+      }
+
+      const { start, end } = windowFromTime(entryTime, BUFFER_MINUTES);
+      const now = new Date();
+
+      // Only allow owner to verify if now is within the buffer window
+      if (!(now >= start && now <= end)) {
+        // do NOT verify. Keep payment_id saved if provided, but do not mark verified.
+        if (payment_id) {
+          // store payment id but do NOT mark verified
+          await client.query(
+            `UPDATE bookings SET payment_id=$1, amount=$2, updated_at=NOW() WHERE id=$3`,
+            [payment_id, amount ?? booking.amount ?? 0, booking_id]
+          );
+          await client.query('COMMIT');
+          return res.status(400).json({
+            message: 'Verification failed: outside verification window.',
+            detail: `Allowed verification window: ${start.toISOString()} — ${end.toISOString()}`
+          });
+        } else {
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            message: 'Verification failed: outside verification window.',
+            detail: `Allowed verification window: ${start.toISOString()} — ${end.toISOString()}`
+          });
+        }
+      }
+
+      // OK: within window → perform verification
+      // Save payment info if supplied; if caller used 'owner_confirm' and booking.payment_id exists, keep existing payment_id
+      const finalPaymentId = (payment_id && payment_id !== 'owner_confirm') ? payment_id : (booking.payment_id || (payment_id === 'owner_confirm' ? booking.payment_id || '' : '') );
+      const finalAmount = amount ?? booking.amount ?? 0;
+
       await client.query(
-        `UPDATE bookings 
+        `UPDATE bookings
          SET is_verified=true, payment_id=$1, amount=$2, verified_at=NOW(), updated_at=NOW()
          WHERE id=$3`,
-        [payment_id, amount || booking.amount || 0, booking_id]
+        [finalPaymentId || '', finalAmount, booking_id]
       );
 
-      // 3. Update parking slot counts (counts track VERIFIED bookings only)
+      // Update parking counts (verified bookings only)
       if (booking.vehicle_type === 'car') {
         await client.query(
           `UPDATE parking_areas
@@ -694,7 +727,7 @@ app.post('/api/bookings/verify', async (req, res) => {
 
       await client.query('COMMIT');
 
-      // 4. Broadcast socket update so UI turns RED immediately
+      // Broadcast socket update so UI turns to booked immediately
       io.to(`parking_${booking.parking_id}_${booking.vehicle_type}`).emit("slot_update", {
         parking_id: booking.parking_id,
         slot_number: booking.slot_number,
@@ -705,7 +738,7 @@ app.post('/api/bookings/verify', async (req, res) => {
 
       return res.status(200).json({
         message: 'Booking verified successfully',
-        verified_at: now
+        verified_at: new Date().toISOString()
       });
 
     } catch (err2) {
@@ -715,12 +748,12 @@ app.post('/api/bookings/verify', async (req, res) => {
     } finally {
       client.release();
     }
-
   } catch (err) {
     console.error('Verify booking outer error:', err);
     return res.status(500).json({ message: 'Internal Server Error' });
   }
 });
+
 
 // -------------------- Cancel booking --------------------
 app.post("/api/bookings/cancel", async (req, res) => {
