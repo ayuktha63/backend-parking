@@ -666,8 +666,10 @@ app.post('/api/bookings/verify', async (req, res) => {
 
       await client.query(
         `UPDATE bookings
-         SET is_verified=true, payment_id=$1, amount=$2, verified_at=NOW(), updated_at=NOW()
-         WHERE id=$3`,
+SET is_verified=true,
+    verified_at=NOW(),
+    updated_at=NOW()
+WHERE id=$1`,
         [payment_id || booking.payment_id || "", amount ?? booking.amount ?? 0, booking_id]
       );
 
