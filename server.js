@@ -610,14 +610,13 @@ app.post('/api/owner/bookings', processBooking);
 
 // -------------------- Verify booking (FIXED: RELAXED TIME CHECK) --------------------
 // We remove the manual +5.5 hours calculation logic.
-// We remove the strict return 400.
-// We just log if it's outside the window, but allow the update to happen.
+// -------------------- Verify booking (FINAL – owner-only, no payment ID) --------------------
 app.post('/api/bookings/verify', async (req, res) => {
   console.log("\n====== 🔍 VERIFY BOOKING ENDPOINT HIT ======");
   console.log("Request Body:", req.body);
 
   try {
-    const { booking_id, payment_id, amount } = req.body || {};
+    const { booking_id } = req.body || {};
 
     if (!booking_id) {
       console.log("❌ booking_id missing");
@@ -643,10 +642,12 @@ app.post('/api/bookings/verify', async (req, res) => {
 
       const booking = bRes.rows[0];
 
-      // --- TIME WINDOW CHECK (RELAXED) ---
-      // We just parse the time normally. No manual +5.5h math.
+      // ---------------- TIME WINDOW CHECK (RELAXED) ----------------
       console.log("🔍 Booking entry_time raw:", booking.entry_time);
-     const entryTime = booking.entry_time ? new Date(booking.entry_time + "Z") : null;
+
+      const entryTime = booking.entry_time
+        ? new Date(booking.entry_time + "Z")
+        : null;
 
       const { start, end } = windowFromTime(entryTime, BUFFER_MINUTES);
       const now = new Date();
@@ -657,24 +658,31 @@ app.post('/api/bookings/verify', async (req, res) => {
       console.log("Inside window? -->", now >= start && now <= end);
 
       if (!(now >= start && now <= end)) {
-        // !!! FIX: We LOG the mismatch but DO NOT RETURN 400.
-        // This accepts the verification even if there is a timezone mismatch.
-        console.warn("⚠️ Verification outside window (likely Timezone drift) - ALLOWING for Owner");
+        console.warn("⚠️ Verification outside window (timezone drift) – ALLOWING OWNER OVERRIDE");
       }
 
+      // ---------------- OWNER VERIFICATION (NO PAYMENT ID) ----------------
       console.log("✅ Proceeding to verify booking");
 
       await client.query(
         `UPDATE bookings
-SET is_verified=true,
-    verified_at=NOW(),
-    updated_at=NOW()
-WHERE id=$1`,
-        [payment_id || booking.payment_id || "", amount ?? booking.amount ?? 0, booking_id]
+         SET is_verified=true,
+             verified_at=NOW(),
+             updated_at=NOW()
+         WHERE id=$1`,
+        [booking_id]
       );
 
       await client.query('COMMIT');
       console.log("✅ Booking verified successfully");
+
+      // Emit websocket update
+      io.to(`parking_${booking.parking_id}_${booking.vehicle_type}`).emit("slot_update", {
+        parking_id: booking.parking_id,
+        slot_number: booking.slot_number,
+        vehicle_type: booking.vehicle_type,
+        status: "booked"
+      });
 
       return res.status(200).json({ message: "Booking verified successfully" });
 
