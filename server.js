@@ -282,7 +282,7 @@ async function getOccupancyPricing(parkingId, vehicleType, parkingAreaOverride =
   const guardedMultiplier = clamp(multiplier, boundedMin, boundedMax);
   const dynamicPrice = roundPrice(basePrice * guardedMultiplier);
   const demandLevel = getDemandLevel(occupancyRatio);
-  const advancePayableNow = getAdvancePayableNow(dynamicPrice, demandLevel);
+  const advancePayableNow = 1;
 
   return {
     parking_id: parkingId,
