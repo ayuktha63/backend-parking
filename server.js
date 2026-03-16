@@ -406,6 +406,47 @@ app.post('/api/holds', async (req, res) => {
   }
 });
 
+// -------------------- Release hold endpoint --------------------
+// Releases an active hold owned by the requesting phone.
+app.delete('/api/holds', async (req, res) => {
+  try {
+    const { parking_id, slot_number, vehicle_type, phone } = req.body || {};
+    if (!parking_id || !slot_number || !vehicle_type || !phone) {
+      return res.status(400).json({ message: 'parking_id, slot_number, vehicle_type and phone required' });
+    }
+
+    const parkingId = toInt(parking_id);
+    const slotNum = Number.isInteger(Number(slot_number)) ? parseInt(slot_number, 10) : null;
+    const vType = normalizeVehicleType(vehicle_type);
+
+    if (!parkingId || !slotNum) return res.status(400).json({ message: 'Invalid ids' });
+
+    const deleted = await pool.query(
+      `DELETE FROM slot_holds
+       WHERE parking_id=$1 AND slot_number=$2 AND vehicle_type=$3 AND phone=$4 AND hold_expires_at > NOW()
+       RETURNING parking_id, slot_number, vehicle_type`,
+      [parkingId, slotNum, vType, phone]
+    );
+
+    if (!deleted.rows.length) {
+      return res.status(404).json({ message: 'No active hold found for this user and slot' });
+    }
+
+    io.to(`parking_${parkingId}_${vType}`).emit('slot_update', {
+      parking_id: parkingId,
+      slot_number: slotNum,
+      vehicle_type: vType,
+      status: 'available',
+      phone,
+    });
+
+    return res.status(200).json({ message: 'Hold released', slot_number: slotNum });
+  } catch (e) {
+    console.error('Error releasing hold:', e);
+    return res.status(500).json({ message: 'Internal Server Error' });
+  }
+});
+
 // -------------------- Get slots (user) — optimized --------------------
 app.get('/api/parking_areas/:id/slots', async (req, res) => {
   try {
