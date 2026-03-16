@@ -81,7 +81,7 @@ const PRICING_CONFIG = {
     car: 20,
     bike: 10,
   },
-  occupancyWeight: 0.8,
+  occupancyWeight: 0.2,
   forecastWeight: 0.35,
   minMultiplier: 1,
   maxMultiplier: 1.8,
