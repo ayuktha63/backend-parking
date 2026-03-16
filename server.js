@@ -75,15 +75,32 @@ const UNVERIFIED_GRACE_MINUTES = 5; // unverified booking considered active for 
 const HOLD_SECONDS = 120;         // 2 minutes hold
 const UNVERIFIED_EXPIRY_SECONDS = UNVERIFIED_GRACE_MINUTES * 60; // 5 minutes
 
-// Phase 1 dynamic pricing: occupancy-based only.
+// Dynamic pricing + occupancy forecasting.
 const PRICING_CONFIG = {
   basePrice: {
     car: 20,
     bike: 10,
   },
   occupancyWeight: 0.8,
+  forecastWeight: 0.35,
   minMultiplier: 1,
   maxMultiplier: 1.8,
+  maxStepUpPerRequest: 0.18,
+  maxStepDownPerRequest: 0.15,
+  forecastLookbackMinutes: 60,
+  forecastHorizonMinutes: 60,
+  demandSignalWeights: {
+    activeHold: 0.55,
+    recentPendingBooking: 0.45,
+    recentVerifiedBooking: 0.25,
+    recentDeparture: -0.35,
+  },
+  advanceRatioByDemand: {
+    low: 0.2,
+    medium: 0.3,
+    high: 0.4,
+    fallback: 0.25,
+  },
 };
 
 function roundPrice(value) {
@@ -94,6 +111,108 @@ function getDemandLevel(occupancyRatio) {
   if (occupancyRatio >= 0.8) return 'high';
   if (occupancyRatio >= 0.5) return 'medium';
   return 'low';
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function round2(value) {
+  return Number((Number(value) || 0).toFixed(2));
+}
+
+function getAdvancePayableNow(dynamicPrice, demandLevel) {
+  const ratio = PRICING_CONFIG.advanceRatioByDemand[demandLevel] || PRICING_CONFIG.advanceRatioByDemand.fallback;
+  const advance = Math.ceil((Number(dynamicPrice) || 0) * ratio);
+  return Math.max(1, advance);
+}
+
+async function getDemandForecast(parkingId, vType, totalSlots, occupiedSlots) {
+  if (totalSlots <= 0) {
+    return {
+      horizon_minutes: PRICING_CONFIG.forecastHorizonMinutes,
+      projected_occupancy_ratio: 0,
+      projected_occupied_slots: 0,
+      projected_demand_level: 'low',
+      confidence: 0,
+      reason: 'No capacity configured for this vehicle type',
+      signals: {
+        active_holds: 0,
+        recent_pending_bookings: 0,
+        recent_verified_bookings: 0,
+        recent_departures: 0,
+      },
+    };
+  }
+
+  const lookback = PRICING_CONFIG.forecastLookbackMinutes;
+
+  const [holdRes, pendingRes, verifiedRes, departuresRes] = await Promise.all([
+    pool.query(
+      `SELECT COUNT(*)::int AS c
+       FROM slot_holds
+       WHERE parking_id=$1 AND vehicle_type=$2 AND hold_expires_at > NOW()`,
+      [parkingId, vType]
+    ),
+    pool.query(
+      `SELECT COUNT(*)::int AS c
+       FROM bookings
+       WHERE parking_id=$1 AND vehicle_type=$2 AND is_verified=false
+         AND created_at > NOW() - ($3 || ' minutes')::interval`,
+      [parkingId, vType, lookback]
+    ),
+    pool.query(
+      `SELECT COUNT(*)::int AS c
+       FROM bookings
+       WHERE parking_id=$1 AND vehicle_type=$2 AND is_verified=true
+         AND created_at > NOW() - ($3 || ' minutes')::interval`,
+      [parkingId, vType, lookback]
+    ),
+    pool.query(
+      `SELECT COUNT(*)::int AS c
+       FROM booking_history
+       WHERE parking_id=$1 AND vehicle_type=$2
+         AND archived_at > NOW() - ($3 || ' minutes')::interval`,
+      [parkingId, vType, lookback]
+    ),
+  ]);
+
+  const activeHolds = Number(holdRes.rows[0]?.c || 0);
+  const pendingBookings = Number(pendingRes.rows[0]?.c || 0);
+  const verifiedBookings = Number(verifiedRes.rows[0]?.c || 0);
+  const recentDepartures = Number(departuresRes.rows[0]?.c || 0);
+
+  const w = PRICING_CONFIG.demandSignalWeights;
+  const signalDelta =
+    (activeHolds * w.activeHold) +
+    (pendingBookings * w.recentPendingBooking) +
+    (verifiedBookings * w.recentVerifiedBooking) +
+    (recentDepartures * w.recentDeparture);
+
+  const projectedOccupiedSlots = clamp(Math.round(occupiedSlots + signalDelta), 0, totalSlots);
+  const projectedOccupancyRatio = clamp(projectedOccupiedSlots / totalSlots, 0, 1);
+  const projectedDemandLevel = getDemandLevel(projectedOccupancyRatio);
+
+  const signalVolume = activeHolds + pendingBookings + verifiedBookings + recentDepartures;
+  const confidence = clamp(signalVolume / Math.max(totalSlots, 1), 0.2, 1);
+
+  const reason =
+    `Signals ${lookback}m: holds=${activeHolds}, pending=${pendingBookings}, verified=${verifiedBookings}, departures=${recentDepartures}`;
+
+  return {
+    horizon_minutes: PRICING_CONFIG.forecastHorizonMinutes,
+    projected_occupancy_ratio: round2(projectedOccupancyRatio),
+    projected_occupied_slots: projectedOccupiedSlots,
+    projected_demand_level: projectedDemandLevel,
+    confidence: round2(confidence),
+    reason,
+    signals: {
+      active_holds: activeHolds,
+      recent_pending_bookings: pendingBookings,
+      recent_verified_bookings: verifiedBookings,
+      recent_departures: recentDepartures,
+    },
+  };
 }
 
 async function getOccupancyPricing(parkingId, vehicleType, parkingAreaOverride = null) {
@@ -111,6 +230,7 @@ async function getOccupancyPricing(parkingId, vehicleType, parkingAreaOverride =
     : (PRICING_CONFIG.basePrice[vType] || PRICING_CONFIG.basePrice.car);
 
   if (totalSlots <= 0) {
+    const forecast = await getDemandForecast(parkingId, vType, totalSlots, 0);
     return {
       parking_id: parkingId,
       vehicle_type: vType,
@@ -121,6 +241,9 @@ async function getOccupancyPricing(parkingId, vehicleType, parkingAreaOverride =
       multiplier: 1,
       dynamic_price: roundPrice(basePrice),
       demand_level: 'low',
+      forecast,
+      forecast_reason: forecast.reason,
+      advance_payable_now: 1,
       currency: 'INR',
     };
   }
@@ -134,23 +257,47 @@ async function getOccupancyPricing(parkingId, vehicleType, parkingAreaOverride =
 
   const occupiedSlots = Number(occupiedResult.rows[0]?.occupied_slots || 0);
   const occupancyRatio = Math.min(occupiedSlots / totalSlots, 1);
-  const rawMultiplier = 1 + (occupancyRatio * PRICING_CONFIG.occupancyWeight);
+  const forecast = await getDemandForecast(parkingId, vType, totalSlots, occupiedSlots);
+  const forecastRatio = Number(forecast.projected_occupancy_ratio || occupancyRatio);
+
+  // Blend current occupancy with near-term forecast for pricing stability.
+  const effectiveOccupancy =
+    ((1 - PRICING_CONFIG.forecastWeight) * occupancyRatio) +
+    (PRICING_CONFIG.forecastWeight * forecastRatio);
+
+  const rawMultiplier = 1 + (effectiveOccupancy * PRICING_CONFIG.occupancyWeight);
   const multiplier = Math.min(
     Math.max(rawMultiplier, PRICING_CONFIG.minMultiplier),
     PRICING_CONFIG.maxMultiplier
   );
-  const dynamicPrice = roundPrice(basePrice * multiplier);
+  const currentOccMultiplier = 1 + (occupancyRatio * PRICING_CONFIG.occupancyWeight);
+  const boundedMin = Math.max(
+    PRICING_CONFIG.minMultiplier,
+    currentOccMultiplier - PRICING_CONFIG.maxStepDownPerRequest
+  );
+  const boundedMax = Math.min(
+    PRICING_CONFIG.maxMultiplier,
+    currentOccMultiplier + PRICING_CONFIG.maxStepUpPerRequest
+  );
+  const guardedMultiplier = clamp(multiplier, boundedMin, boundedMax);
+  const dynamicPrice = roundPrice(basePrice * guardedMultiplier);
+  const demandLevel = getDemandLevel(occupancyRatio);
+  const advancePayableNow = getAdvancePayableNow(dynamicPrice, demandLevel);
 
   return {
     parking_id: parkingId,
     vehicle_type: vType,
     total_slots: totalSlots,
     occupied_slots: occupiedSlots,
-    occupancy_ratio: Number(occupancyRatio.toFixed(2)),
+    occupancy_ratio: round2(occupancyRatio),
     base_price: roundPrice(basePrice),
-    multiplier: Number(multiplier.toFixed(2)),
+    multiplier: round2(guardedMultiplier),
     dynamic_price: dynamicPrice,
-    demand_level: getDemandLevel(occupancyRatio),
+    demand_level: demandLevel,
+    effective_occupancy_ratio: round2(effectiveOccupancy),
+    forecast,
+    forecast_reason: forecast.reason,
+    advance_payable_now: advancePayableNow,
     currency: 'INR',
   };
 }
@@ -338,7 +485,13 @@ app.get('/api/parking_areas/:id/pricing', async (req, res) => {
       ...pricing,
       slot_count: slotCount,
       total_price: roundPrice(pricing.dynamic_price * slotCount),
-      pricing_formula: 'base_price * (1 + occupancy_ratio * 0.8)',
+      pricing_formula: 'base_price * (1 + effective_occupancy_ratio * 0.8) with guardrails',
+      forecast_model: {
+        type: 'occupancy-signal-blend',
+        lookback_minutes: PRICING_CONFIG.forecastLookbackMinutes,
+        horizon_minutes: PRICING_CONFIG.forecastHorizonMinutes,
+        forecast_weight: PRICING_CONFIG.forecastWeight,
+      },
     });
   } catch (e) {
     console.error('Error fetching parking price:', e);
