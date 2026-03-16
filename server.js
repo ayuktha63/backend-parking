@@ -1524,6 +1524,65 @@ app.post('/api/owner/bookings/complete', async (req, res) => {
   }
 });
 
+// Dev-only helper: clear active state so apps can start fresh during testing.
+app.post('/api/dev/reset-active-state', async (req, res) => {
+  const { confirm } = req.body || {};
+  if (confirm !== true) {
+    return res.status(400).json({ message: 'Pass {"confirm": true} to reset active state' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const removedHolds = await client.query(
+      `DELETE FROM slot_holds
+       RETURNING parking_id, slot_number, vehicle_type`
+    );
+
+    const removedBookings = await client.query(
+      `DELETE FROM bookings
+       RETURNING parking_id, slot_number, vehicle_type`
+    );
+
+    await client.query(
+      `UPDATE parking_areas
+       SET available_car_slots = COALESCE(total_car_slots, 0),
+           booked_car_slots = 0,
+           available_bike_slots = COALESCE(total_bike_slots, 0),
+           booked_bike_slots = 0,
+           updated_at = NOW()`
+    );
+
+    await client.query('COMMIT');
+
+    const changedSlots = [...removedHolds.rows, ...removedBookings.rows];
+    for (const row of changedSlots) {
+      io.to(`parking_${row.parking_id}_${row.vehicle_type}`).emit('slot_update', {
+        parking_id: row.parking_id,
+        slot_number: row.slot_number,
+        vehicle_type: row.vehicle_type,
+        status: 'available',
+      });
+    }
+
+    return res.status(200).json({
+      message: 'Active state reset complete',
+      cleared_holds: removedHolds.rowCount,
+      cleared_bookings: removedBookings.rowCount,
+      touched_slots: changedSlots.length,
+    });
+  } catch (e) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+    console.error('Error resetting active state:', e);
+    return res.status(500).json({ message: 'Failed to reset active state' });
+  } finally {
+    client.release();
+  }
+});
+
 // -------------------- WebSocket Setup --------------------
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
