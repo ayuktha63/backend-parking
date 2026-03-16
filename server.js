@@ -138,6 +138,26 @@ app.post('/api/owner/bookings/verify', async (req, res) => {
         [booking_id]
       );
 
+      if (booking.vehicle_type === 'car') {
+        await client.query(
+          `UPDATE parking_areas
+           SET available_car_slots = GREATEST(available_car_slots - 1, 0),
+               booked_car_slots = booked_car_slots + 1,
+               updated_at = NOW()
+           WHERE id=$1`,
+          [booking.parking_id]
+        );
+      } else {
+        await client.query(
+          `UPDATE parking_areas
+           SET available_bike_slots = GREATEST(available_bike_slots - 1, 0),
+               booked_bike_slots = booked_bike_slots + 1,
+               updated_at = NOW()
+           WHERE id=$1`,
+          [booking.parking_id]
+        );
+      }
+
       await client.query('COMMIT');
 
       io.to(`parking_${booking.parking_id}_${booking.vehicle_type}`).emit('slot_update', {
@@ -746,23 +766,8 @@ app.get('/api/parking_areas/:id/slots', async (req, res) => {
             if (now >= bwin.start && now <= bwin.end) status = 'booked';
           }
         } else {
-          // unverified booking considered only if recently created (UNVERIFIED_GRACE_MINUTES)
-          const createdAt = new Date(booking.created_at);
-          const graceStart = new Date(createdAt.getTime());
-          const graceEnd = new Date(createdAt.getTime() + UNVERIFIED_GRACE_MINUTES * 60000);
-          if (userEntry) {
-            // overlap check against bookingEntry with BUFFER_MINUTES
-            const newStart = new Date(userEntry.getTime() - BUFFER_MINUTES * 60000);
-            const newEnd = new Date(userEntry.getTime() + BUFFER_MINUTES * 60000);
-            const bwin = windowFromTime(bookingEntry, BUFFER_MINUTES);
-            if (windowsOverlap(bwin.start, bwin.end, newStart, newEnd)) status = 'pending';
-          } else {
-            // live view: if booking created within grace window and now close to bookingEntry
-            if (now <= graceEnd) {
-              const bwin = windowFromTime(bookingEntry, BUFFER_MINUTES);
-              if (now >= bwin.start && now <= bwin.end) status = 'pending';
-            }
-          }
+          // Keep owner-created/manual pending bookings visible as occupied immediately.
+          status = 'pending';
         }
       }
 
@@ -1053,6 +1058,26 @@ app.post('/api/bookings/verify', async (req, res) => {
          WHERE id=$1`,
         [booking_id]
       );
+
+      if (booking.vehicle_type === 'car') {
+        await client.query(
+          `UPDATE parking_areas
+           SET available_car_slots = GREATEST(available_car_slots - 1, 0),
+               booked_car_slots = booked_car_slots + 1,
+               updated_at = NOW()
+           WHERE id=$1`,
+          [booking.parking_id]
+        );
+      } else {
+        await client.query(
+          `UPDATE parking_areas
+           SET available_bike_slots = GREATEST(available_bike_slots - 1, 0),
+               booked_bike_slots = booked_bike_slots + 1,
+               updated_at = NOW()
+           WHERE id=$1`,
+          [booking.parking_id]
+        );
+      }
 
       await client.query('COMMIT');
       console.log("✅ Booking verified successfully");
