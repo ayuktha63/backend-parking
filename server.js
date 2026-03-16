@@ -1390,7 +1390,7 @@ app.get('/api/owner/parking_areas/:id/slots', async (req, res) => {
 
     // Fetch holds
     const holdsRes = await pool.query(
-      `SELECT slot_number 
+      `SELECT slot_number, phone
        FROM slot_holds 
        WHERE parking_id=$1 AND vehicle_type=$2 AND hold_expires_at > NOW()`,
       [parking_id, vType]
@@ -1398,7 +1398,7 @@ app.get('/api/owner/parking_areas/:id/slots', async (req, res) => {
 
     const pendingSlots = new Set();
     const bookedSlots = new Set();
-    const heldSlotNumbers = new Set(holdsRes.rows.map(h => h.slot_number));
+    const heldSlotMap = new Map(holdsRes.rows.map(h => [Number(h.slot_number), h.phone]));
 
     for (const row of bookingsRes.rows) {
       if (row.is_verified) bookedSlots.add(row.slot_number);
@@ -1409,11 +1409,17 @@ app.get('/api/owner/parking_areas/:id/slots', async (req, res) => {
       const slot_number = i + 1;
       let status = 'available';
 
-      if (heldSlotNumbers.has(slot_number)) status = 'held';
+      if (heldSlotMap.has(slot_number)) status = 'held';
       else if (pendingSlots.has(slot_number)) status = 'pending';
       else if (bookedSlots.has(slot_number)) status = 'booked';
 
-      return { parking_id, slot_number, vehicle_type: vType, status };
+      return {
+        parking_id,
+        slot_number,
+        vehicle_type: vType,
+        status,
+        held_by: heldSlotMap.get(slot_number) || null,
+      };
     });
 
     return res.status(200).json(allSlots);
