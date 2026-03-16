@@ -103,6 +103,62 @@ const PRICING_CONFIG = {
   },
 };
 
+// Owner verify endpoint kept explicit for owner app compatibility.
+app.post('/api/owner/bookings/verify', async (req, res) => {
+  try {
+    const { booking_id } = req.body || {};
+    if (!booking_id) return res.status(400).json({ message: 'booking_id required' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const bRes = await client.query(
+        `SELECT * FROM bookings WHERE id=$1 LIMIT 1 FOR UPDATE`,
+        [booking_id]
+      );
+
+      if (!bRes.rows.length) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ message: 'Booking not found' });
+      }
+
+      const booking = bRes.rows[0];
+      if (booking.is_verified) {
+        await client.query('COMMIT');
+        return res.status(200).json({ message: 'Booking already verified' });
+      }
+
+      await client.query(
+        `UPDATE bookings
+         SET is_verified=true,
+             verified_at=NOW(),
+             updated_at=NOW()
+         WHERE id=$1`,
+        [booking_id]
+      );
+
+      await client.query('COMMIT');
+
+      io.to(`parking_${booking.parking_id}_${booking.vehicle_type}`).emit('slot_update', {
+        parking_id: booking.parking_id,
+        slot_number: booking.slot_number,
+        vehicle_type: booking.vehicle_type,
+        status: 'booked'
+      });
+
+      return res.status(200).json({ message: 'Booking verified successfully' });
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+      return res.status(500).json({ message: 'Verification failed', error: String(err) });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    return res.status(500).json({ message: 'Internal Server Error' });
+  }
+});
+
 function roundPrice(value) {
   return Math.round(Number(value) || 0);
 }
@@ -125,6 +181,22 @@ function getAdvancePayableNow(dynamicPrice, demandLevel) {
   const ratio = PRICING_CONFIG.advanceRatioByDemand[demandLevel] || PRICING_CONFIG.advanceRatioByDemand.fallback;
   const advance = Math.ceil((Number(dynamicPrice) || 0) * ratio);
   return Math.max(1, advance);
+}
+
+function calculateFinalParkingAmount({ entryTime, exitTime, vehicleType, initialAmount }) {
+  const vType = normalizeVehicleType(vehicleType);
+  const fallbackBase = vType === 'bike' ? 10 : 20;
+  const baseAmount = Math.max(roundPrice(Number(initialAmount) || 0), fallbackBase);
+
+  const start = entryTime ? new Date(entryTime) : new Date();
+  const end = exitTime ? new Date(exitTime) : new Date();
+  const parkedMinutes = Math.max(0, Math.floor((end.getTime() - start.getTime()) / 60000));
+
+  if (parkedMinutes <= 60) return baseAmount;
+
+  const extraMinutes = parkedMinutes - 60;
+  const extraHalfHours = Math.ceil(extraMinutes / 30);
+  return baseAmount + (extraHalfHours * 10);
 }
 
 async function getDemandForecast(parkingId, vType, totalSlots, occupiedSlots) {
@@ -1010,6 +1082,7 @@ app.post('/api/bookings/verify', async (req, res) => {
 });
 
 
+
 // -------------------- Cancel booking --------------------
 app.post("/api/bookings/cancel", async (req, res) => {
   const client = await pool.connect();
@@ -1368,7 +1441,14 @@ app.post('/api/owner/bookings/complete', async (req, res) => {
 
     const booking = activeRes.rows[0];
     const finalExitTime = exit_time ? new Date(exit_time) : new Date();
-    const finalAmount = amount || booking.amount || 0;
+    const calculatedAmount = calculateFinalParkingAmount({
+      entryTime: booking.entry_time,
+      exitTime: finalExitTime,
+      vehicleType: vType,
+      initialAmount: booking.amount,
+    });
+    const clientProvidedAmount = Number(amount) || 0;
+    const finalAmount = Math.max(calculatedAmount, clientProvidedAmount);
 
     await client.query(
       `INSERT INTO booking_history
@@ -1397,7 +1477,13 @@ app.post('/api/owner/bookings/complete', async (req, res) => {
       status: "available"
     });
 
-    return res.status(200).json({ message: 'Booking completed and slot freed', amount: finalAmount });
+    return res.status(200).json({
+      message: 'Booking completed and slot freed',
+      amount: finalAmount,
+      calculated_amount: calculatedAmount,
+      collected_now: 1,
+      pricing_rule: 'first_hour_initial_price_then_plus_10_every_30_mins'
+    });
   } catch (e) {
     try { await client.query('ROLLBACK'); } catch (_) {}
     console.error('Error completing booking:', e);
