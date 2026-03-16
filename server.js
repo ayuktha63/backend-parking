@@ -75,6 +75,86 @@ const UNVERIFIED_GRACE_MINUTES = 5; // unverified booking considered active for 
 const HOLD_SECONDS = 120;         // 2 minutes hold
 const UNVERIFIED_EXPIRY_SECONDS = UNVERIFIED_GRACE_MINUTES * 60; // 5 minutes
 
+// Phase 1 dynamic pricing: occupancy-based only.
+const PRICING_CONFIG = {
+  basePrice: {
+    car: 20,
+    bike: 10,
+  },
+  occupancyWeight: 0.8,
+  minMultiplier: 1,
+  maxMultiplier: 1.8,
+};
+
+function roundPrice(value) {
+  return Math.round(Number(value) || 0);
+}
+
+function getDemandLevel(occupancyRatio) {
+  if (occupancyRatio >= 0.8) return 'high';
+  if (occupancyRatio >= 0.5) return 'medium';
+  return 'low';
+}
+
+async function getOccupancyPricing(parkingId, vehicleType, parkingAreaOverride = null) {
+  const vType = normalizeVehicleType(vehicleType);
+  const parkingArea = parkingAreaOverride || (
+    await pool.query('SELECT * FROM parking_areas WHERE id=$1 LIMIT 1', [parkingId])
+  ).rows[0];
+
+  if (!parkingArea) return null;
+
+  const totalSlots = Number(vType === 'car' ? parkingArea.total_car_slots : parkingArea.total_bike_slots) || 0;
+  const configuredBasePrice = Number(vType === 'car' ? parkingArea.base_car_price : parkingArea.base_bike_price);
+  const basePrice = Number.isFinite(configuredBasePrice) && configuredBasePrice > 0
+    ? configuredBasePrice
+    : (PRICING_CONFIG.basePrice[vType] || PRICING_CONFIG.basePrice.car);
+
+  if (totalSlots <= 0) {
+    return {
+      parking_id: parkingId,
+      vehicle_type: vType,
+      total_slots: 0,
+      occupied_slots: 0,
+      occupancy_ratio: 0,
+      base_price: roundPrice(basePrice),
+      multiplier: 1,
+      dynamic_price: roundPrice(basePrice),
+      demand_level: 'low',
+      currency: 'INR',
+    };
+  }
+
+  const occupiedResult = await pool.query(
+    `SELECT COUNT(DISTINCT slot_number) AS occupied_slots
+     FROM bookings
+     WHERE parking_id=$1 AND vehicle_type=$2`,
+    [parkingId, vType]
+  );
+
+  const occupiedSlots = Number(occupiedResult.rows[0]?.occupied_slots || 0);
+  const occupancyRatio = Math.min(occupiedSlots / totalSlots, 1);
+  const rawMultiplier = 1 + (occupancyRatio * PRICING_CONFIG.occupancyWeight);
+  const multiplier = Math.min(
+    Math.max(rawMultiplier, PRICING_CONFIG.minMultiplier),
+    PRICING_CONFIG.maxMultiplier
+  );
+  const dynamicPrice = roundPrice(basePrice * multiplier);
+
+  return {
+    parking_id: parkingId,
+    vehicle_type: vType,
+    total_slots: totalSlots,
+    occupied_slots: occupiedSlots,
+    occupancy_ratio: Number(occupancyRatio.toFixed(2)),
+    base_price: roundPrice(basePrice),
+    multiplier: Number(multiplier.toFixed(2)),
+    dynamic_price: dynamicPrice,
+    demand_level: getDemandLevel(occupancyRatio),
+    currency: 'INR',
+  };
+}
+
 // -------------------- OTP endpoints (unchanged) --------------------
 app.post("/api/auth/send-otp", async (req, res) => {
   const { phone } = req.body || {};
@@ -236,6 +316,32 @@ app.get('/api/parking_areas/:id', async (req, res) => {
     return res.status(200).json({ ...area, location: { lat: area.lat, lng: area.lng } });
   } catch (e) {
     console.error('Error fetching parking area:', e);
+    return res.status(500).json({ message: 'Internal Server Error' });
+  }
+});
+
+app.get('/api/parking_areas/:id/pricing', async (req, res) => {
+  try {
+    const parkingId = toInt(req.params.id);
+    const vType = normalizeVehicleType(req.query?.vehicle_type);
+    const slotCount = Math.max(toInt(req.query?.slot_count) || 1, 1);
+
+    if (!parkingId) return res.status(400).json({ message: 'Invalid parking area ID' });
+    if (!['car', 'bike'].includes(vType)) {
+      return res.status(400).json({ message: 'Valid vehicle_type query param required' });
+    }
+
+    const pricing = await getOccupancyPricing(parkingId, vType);
+    if (!pricing) return res.status(404).json({ message: 'Parking area not found' });
+
+    return res.status(200).json({
+      ...pricing,
+      slot_count: slotCount,
+      total_price: roundPrice(pricing.dynamic_price * slotCount),
+      pricing_formula: 'base_price * (1 + occupancy_ratio * 0.8)',
+    });
+  } catch (e) {
+    console.error('Error fetching parking price:', e);
     return res.status(500).json({ message: 'Internal Server Error' });
   }
 });
@@ -479,6 +585,9 @@ async function processBooking(req, res) {
     const totalSlots = vType === 'car' ? parkingArea.total_car_slots : parkingArea.total_bike_slots;
     if (slotNum > totalSlots || slotNum <= 0) return res.status(400).json({ message: 'Invalid slot_number for the parking area' });
 
+    const pricing = await getOccupancyPricing(parkingId, vType, parkingArea);
+    const finalAmount = pricing?.dynamic_price || roundPrice(amount);
+
     // TIME OVERLAP: check against active bookings (transaction later ensures atomic)
     const overlap = await hasTimeOverlap(parkingId, slotNum, vType, entryTime);
     if (overlap) {
@@ -532,7 +641,7 @@ async function processBooking(req, res) {
         entryTime,
         null,
         payment_id || '',
-        amount || 0,
+        finalAmount,
         isVerified
       ]
     );
@@ -595,7 +704,13 @@ async function processBooking(req, res) {
       phone
     });
 
-    return res.status(200).json({ message: isVerified ? 'Slot booked (verified)' : 'Slot reserved (unverified)', booking_id: bookingId, slot_number: slotNum });
+    return res.status(200).json({
+      message: isVerified ? 'Slot booked (verified)' : 'Slot reserved (unverified)',
+      booking_id: bookingId,
+      slot_number: slotNum,
+      amount: finalAmount,
+      unit_price: pricing?.dynamic_price || finalAmount,
+    });
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (e) { /* ignore */ }
     console.error('Error booking slot:', err);
