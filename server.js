@@ -1112,7 +1112,7 @@ app.post('/api/bookings/verify', async (req, res) => {
 app.post("/api/bookings/cancel", async (req, res) => {
   const client = await pool.connect();
   try {
-    const { booking_id, parking_id, vehicle_type, cancelled_by } = req.body || {};
+    const { booking_id, parking_id, vehicle_type } = req.body || {};
     if (!booking_id || !parking_id || !vehicle_type) {
       return res.status(400).json({ message: "booking_id, parking_id, and vehicle_type required" });
     }
@@ -1155,8 +1155,8 @@ app.post("/api/bookings/cancel", async (req, res) => {
       `INSERT INTO booking_history
        (booking_id, parking_id, slot_id, slot_number, phone, vehicle_type, number_plate,
         entry_time, exit_time, payment_id, amount, archived_at, cancelled, cancelled_at,
-        refund_percent, refund_amount, is_verified, verified_at, cancelled_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),true,NOW(),$12,$13,$14,$15,$16)`,
+        refund_percent, refund_amount, not_verified, verified_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),true,NOW(),$12,$13,$14,$15)`,
       [
         booking.id,
         booking.parking_id,
@@ -1171,9 +1171,8 @@ app.post("/api/bookings/cancel", async (req, res) => {
         booking.amount || 0,
         refundPercent,
         refundAmount,
-        booking.is_verified || false,
-        booking.verified_at || null,
-        cancelled_by || null
+        !(booking.is_verified === true),
+        booking.verified_at || null
       ]
     );
 
@@ -1483,9 +1482,9 @@ app.post('/api/owner/bookings/complete', async (req, res) => {
 
     await client.query(
       `INSERT INTO booking_history
-       (booking_id, parking_id, slot_id, slot_number, phone, vehicle_type, number_plate, entry_time, exit_time, payment_id, amount, archived_at, is_verified, verified_at)
+       (booking_id, parking_id, slot_id, slot_number, phone, vehicle_type, number_plate, entry_time, exit_time, payment_id, amount, archived_at, not_verified, verified_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),$12,$13)`,
-      [booking.id, booking.parking_id, booking.slot_id, booking.slot_number, booking.phone, booking.vehicle_type, booking.number_plate, booking.entry_time, finalExitTime, payment_id || booking.payment_id || '', finalAmount, booking.is_verified || false, booking.verified_at || null]
+      [booking.id, booking.parking_id, booking.slot_id, booking.slot_number, booking.phone, booking.vehicle_type, booking.number_plate, booking.entry_time, finalExitTime, payment_id || booking.payment_id || '', finalAmount, !(booking.is_verified === true), booking.verified_at || null]
     );
 
     await client.query('DELETE FROM bookings WHERE id=$1', [bookingId]);
