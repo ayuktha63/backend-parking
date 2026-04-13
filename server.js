@@ -893,8 +893,11 @@ async function processBooking(req, res) {
       // If holdOwner === phone, we will delete the hold below (convert)
     }
 
-    // Decide is_verified based on presence of payment_id
-    const isVerified = false; 
+    // Mark booking verified only when payment_id is provided.
+    const hasPaymentId = typeof payment_id === 'string'
+      ? payment_id.trim().length > 0
+      : Boolean(payment_id);
+    const isVerified = hasPaymentId;
 
     // Insert booking (unverified if no payment_id)
     const insertBookingRes = await client.query(
@@ -1525,6 +1528,10 @@ app.post('/api/owner/bookings/complete', async (req, res) => {
 
 // Dev-only helper: clear active state so apps can start fresh during testing.
 app.post('/api/dev/reset-active-state', async (req, res) => {
+  if (process.env.ENABLE_DEV_RESET !== 'true') {
+    return res.status(403).json({ message: 'Dev reset endpoint is disabled' });
+  }
+
   const { confirm } = req.body || {};
   if (confirm !== true) {
     return res.status(400).json({ message: 'Pass {"confirm": true} to reset active state' });
