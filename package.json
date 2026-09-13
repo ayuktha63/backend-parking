@@ -1,20 +1,48 @@
 {
-  "name": "parking-backend",
-  "version": "1.0.0",
+  "name": "parqx-backend",
+  "version": "2.0.0",
+  "description": "PARQX \u2014 parking discovery and reservation API",
   "main": "server.js",
   "license": "MIT",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.17.0"
+  },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "migrate": "node src/db/migrate.js",
+    "migrate:status": "node src/db/migrate.js --status",
+    "migrate:dry": "node src/db/migrate.js --dry",
+    "migrate:conflicts": "node src/db/migrate.js --conflicts",
+    "migrate:rerun": "node src/db/migrate.js",
+    "test": "node --test",
+    "test:unit": "node --test tests/unit/*.test.js",
+    "test:contract": "node --test tests/contract/*.test.js",
+    "test:watch": "node --test --watch tests/unit/*.test.js",
+    "lint": "eslint src tests --max-warnings=0",
+    "check:secrets": "node scripts/check-secrets.js",
+    "seed:dev": "node scripts/seed-dev.js",
+    "settle:dev": "node scripts/settle-dev-payment.js"
   },
   "dependencies": {
     "axios": "^1.13.2",
+    "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "fs": "0.0.1-security",
-    "mongodb": "^6.21.0",
-    "multer": "^1.4.5-lts.1",
-    "path": "^0.12.7",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
     "pg": "^8.16.3",
-    "socket.io": "^4.8.1"
+    "pino": "^9.4.0",
+    "pino-http": "^10.3.0",
+    "razorpay": "^2.9.4",
+    "socket.io": "^4.8.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0",
+    "supertest": "^7.0.0"
   }
 }

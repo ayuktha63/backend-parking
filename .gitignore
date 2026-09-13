@@ -1,1 +1,20 @@
 node_modules
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Runtime / build output
+*.log
+npm-debug.log*
+coverage/
+.nyc_output/
+dist/
+tmp/
+.DS_Store
+
+# Local database dumps may contain customer PII
+migrations/0000_baseline.sql
+*.dump
+*.sql.gz
