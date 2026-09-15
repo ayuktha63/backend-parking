@@ -1,0 +1,28 @@
+{
+  "root": true,
+  "env": { "node": true, "es2023": true },
+  "parserOptions": { "ecmaVersion": 2023, "sourceType": "script" },
+  "extends": "eslint:recommended",
+  "rules": {
+    "no-unused-vars": ["error", {
+      "argsIgnorePattern": "^_|^(req|res|next)$",
+      "varsIgnorePattern": "^_",
+      "ignoreRestSiblings": true,
+      "caughtErrors": "none"
+    }],
+    "no-console": "error",
+    "eqeqeq": ["error", "smart"],
+    "no-var": "error",
+    "prefer-const": "error",
+    "no-throw-literal": "error",
+    "require-await": "off",
+    "no-return-await": "error"
+  },
+  "overrides": [
+    {
+      "files": ["tests/**/*.js", "scripts/**/*.js"],
+      "rules": { "no-console": "off" }
+    }
+  ],
+  "ignorePatterns": ["node_modules/", "src/routes/legacy/legacyRouter.js"]
+}
