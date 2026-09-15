@@ -16,10 +16,15 @@
  *   3a. The device returns order_id/payment_id/signature → verified here by HMAC.
  *   3b. Razorpay calls the webhook → verified here by body HMAC.
  *   3c. Both arrive, in either order → whichever is first settles; the second is a
- *       no-op, because `markPaid` is conditional on `settled_at IS NULL`.
- *   3d. Neither arrives (app killed mid-payment) → `reconcile` asks the provider.
+ *       no-op, because `markPaid` is conditional on the payment not being PAID.
+ *   3d. Neither arrives (app killed mid-payment) → `reconcile` asks the provider
+ *       for the order's payments; the unpaid-booking sweeper asks the same question
+ *       before giving the slot away.
  *
- * In every path the booking reaches CONFIRMED exactly once.
+ * In every path the booking reaches CONFIRMED exactly once. And when money is
+ * captured for a booking that can no longer be confirmed — it expired, was
+ * cancelled, or another payment already confirmed it — the refund owed is
+ * recorded in the same transaction. Captured money never goes unaccounted for.
  */
 
 const { config } = require('../config');
@@ -38,6 +43,12 @@ const {
   serviceUnavailable,
   DomainErrors,
 } = require('../utils/errors');
+
+/** A payment in one of these states has been received and needs no settling. */
+const SETTLED_STATUSES = ['PAID', 'REFUNDED', 'PARTIALLY_REFUNDED'];
+
+/** Booking states a captured payment has already served. */
+const PAID_BOOKING_STATUSES = ['CONFIRMED', 'CHECKED_IN', 'COMPLETED'];
 
 /* ── order creation ────────────────────────────────────────────────────────── */
 
@@ -198,15 +209,11 @@ async function verifyClientCallback({
   }
 
   // Already settled — by the webhook, or by a previous attempt of this same call.
-  // Report success with the current booking rather than an error: from the
-  // customer's point of view their payment did go through.
-  if (payment.settled_at && payment.status === 'PAID') {
-    const current = await bookingRepository.findByIdForUser({ bookingId, userId });
-    return {
-      verified: true,
-      already_settled: true,
-      booking: bookingService.serializeBooking(current),
-    };
+  // Report the outcome with the current booking rather than an error: from the
+  // customer's point of view their payment did go through. Whether it bought the
+  // booking is a separate question, answered from the booking itself.
+  if (SETTLED_STATUSES.includes(payment.status)) {
+    return alreadySettled({ payment, bookingId });
   }
 
   if (config.features.serverPaymentVerification) {
@@ -221,11 +228,9 @@ async function verifyClientCallback({
         { bookingId, providerOrderId, providerPaymentId },
         'Checkout signature verification FAILED'
       );
-      await paymentRepository.markFailed({
-        paymentId: payment.id,
-        reason: 'signature_verification_failed',
-        payload: { provider_order_id: providerOrderId, provider_payment_id: providerPaymentId },
-      });
+      // Recorded, but the payment is NOT marked failed. A result that does not
+      // verify says nothing about the order at the gateway: the genuine capture may
+      // still arrive by webhook, and it must be able to settle.
       await bookingRepository.recordEvent({
         bookingId,
         eventType: 'payment_verification_failed',
@@ -262,12 +267,15 @@ async function verifyClientCallback({
  */
 async function settle({ payment, providerPaymentId, signature = null, settledVia, verifyPayload = {}, userId = null }) {
   const outcome = await db.withTransaction(async (tx) => {
+    // Booking first, then payment — the order cancellation already takes. Locking
+    // the payment first deadlocked against a cancel, or against a second order for
+    // the same booking being captured at the same moment.
+    await bookingRepository.lockById(payment.booking_id, tx);
     const locked = await paymentRepository.lockById(payment.id, tx);
     if (!locked) throw notFound('That payment could not be found', 'PAYMENT_NOT_FOUND');
 
-    if (locked.settled_at) {
-      return { changed: false, paymentId: locked.id, bookingId: locked.booking_id };
-    }
+    const unchanged = { changed: false, paymentId: locked.id, bookingId: locked.booking_id };
+    if (SETTLED_STATUSES.includes(locked.status)) return unchanged;
 
     const paid = await paymentRepository.markPaid(
       {
@@ -280,10 +288,8 @@ async function settle({ payment, providerPaymentId, signature = null, settledVia
       tx
     );
 
-    if (!paid) {
-      // Lost the race inside the transaction. Not an error.
-      return { changed: false, paymentId: locked.id, bookingId: locked.booking_id };
-    }
+    // Lost the race inside the transaction. Not an error.
+    if (!paid) return unchanged;
 
     await bookingRepository.recordEvent(
       {
@@ -302,21 +308,69 @@ async function settle({ payment, providerPaymentId, signature = null, settledVia
 
     // Same transaction: a payment that is PAID while its booking is still
     // PENDING_PAYMENT is exactly the inconsistency this system exists to avoid.
-    await bookingService.confirmPaid({
+    const confirmation = await bookingService.confirmPaid({
       bookingId: locked.booking_id,
       paymentId: locked.id,
       actorType: settledVia === 'webhook' ? 'provider' : 'customer',
       client: tx,
     });
 
-    return { changed: true, paymentId: locked.id, bookingId: locked.booking_id };
+    if (confirmation.changed) {
+      // Any other order still open for this booking could be paid a second time.
+      await paymentRepository.abandonOpenOrders({ bookingId: locked.booking_id, reason: 'booking_paid' }, tx);
+      return { changed: true, confirmed: true, paymentId: locked.id, bookingId: locked.booking_id };
+    }
+
+    // Money was captured for a booking this payment cannot confirm: another
+    // payment already did, or the booking expired or was cancelled first. The
+    // customer is owed it back, recorded now, in the same transaction — whether
+    // or not refunds are being dispatched yet.
+    const status = confirmation.booking?.status;
+    const reason = PAID_BOOKING_STATUSES.includes(status) ? 'duplicate_payment' : 'captured_after_booking_closed';
+    await paymentRepository.createRefund(
+      { paymentId: locked.id, bookingId: locked.booking_id, amountPaise: locked.amount_paise, reason },
+      tx
+    );
+    await bookingRepository.recordEvent(
+      {
+        bookingId: locked.booking_id,
+        eventType: 'payment_refund_due',
+        actorType: 'system',
+        metadata: { payment_id: locked.id, reason, amount_paise: locked.amount_paise, booking_status: status },
+      },
+      tx
+    );
+    logger.warn(
+      { bookingId: locked.booking_id, paymentId: locked.id, reason, bookingStatus: status },
+      'Payment captured for a booking it cannot confirm; refund recorded'
+    );
+    return { changed: true, confirmed: false, refundDue: true, paymentId: locked.id, bookingId: locked.booking_id };
   });
 
-  const booking = await bookingRepository.findByIdUnscoped(outcome.bookingId);
+  if (!outcome.changed) return alreadySettled({ payment, bookingId: outcome.bookingId });
 
+  const booking = await bookingRepository.findByIdUnscoped(outcome.bookingId);
   return {
     verified: true,
-    already_settled: !outcome.changed,
+    already_settled: false,
+    confirmed: outcome.confirmed,
+    refund_due: Boolean(outcome.refundDue),
+    booking: bookingService.serializeBooking(booking),
+  };
+}
+
+/**
+ * The answer for a payment that was settled earlier: what the booking is now, and
+ * whether this payment is owed back.
+ */
+async function alreadySettled({ payment, bookingId }) {
+  const booking = await bookingRepository.findByIdUnscoped(bookingId);
+  const refund = await paymentRepository.findRefundForPayment(payment.id);
+  return {
+    verified: true,
+    already_settled: true,
+    confirmed: PAID_BOOKING_STATUSES.includes(booking?.status) && !refund,
+    refund_due: Boolean(refund),
     booking: bookingService.serializeBooking(booking),
   };
 }
@@ -336,7 +390,7 @@ async function recordClientFailure({ userId, bookingId, providerOrderId, reason 
     ? await paymentRepository.findByProviderOrderId(providerOrderId)
     : await paymentRepository.findOpenForBooking(bookingId);
 
-  if (payment && Number(payment.booking_id) === Number(bookingId) && !payment.settled_at) {
+  if (payment && Number(payment.booking_id) === Number(bookingId) && !SETTLED_STATUSES.includes(payment.status)) {
     await paymentRepository.markFailed({
       paymentId: payment.id,
       reason: reason || 'cancelled_by_user',
@@ -464,7 +518,8 @@ async function webhookPaymentCaptured(entity) {
     verifyPayload: { source: 'webhook', provider_payment_id: entity.id },
   });
 
-  return { action: result.already_settled ? 'already_settled' : 'confirmed' };
+  if (result.already_settled) return { action: 'already_settled' };
+  return { action: result.confirmed ? 'confirmed' : 'refund_due' };
 }
 
 async function webhookPaymentFailed(entity) {
@@ -517,60 +572,69 @@ async function webhookRefundProcessed(entity) {
  * Asks the provider what actually happened.
  *
  * The path for the case neither callback nor webhook covers: the app was killed
- * during checkout, so the device never reported back, and the webhook has not
- * arrived (or the deployment had no webhook configured). Called when the customer
- * reopens a booking that is still PENDING_PAYMENT.
+ * during checkout, or the customer finished in an external wallet, so the device
+ * never reported back and the webhook has not arrived (or the deployment has none
+ * configured). Called when the customer reopens a booking that is still
+ * PENDING_PAYMENT.
  */
 async function reconcile({ userId, bookingId }) {
   const booking = await bookingRepository.findByIdForUser({ bookingId, userId });
   if (!booking) throw notFound('That booking could not be found', 'BOOKING_NOT_FOUND');
+  return reconcileBooking({ booking, userId });
+}
 
-  if (booking.status !== 'PENDING_PAYMENT') {
-    return { reconciled: false, reason: 'not_pending', booking: bookingService.serializeBooking(booking) };
-  }
+/**
+ * Settles a pending booking from the gateway's own record of its orders.
+ *
+ * Asks about ORDERS, not payment ids. The server learns a payment id only from the
+ * callback or the webhook — precisely the two things missing in the cases this
+ * exists for — so asking about a known payment id could never find anything.
+ *
+ * Also run by the unpaid-booking sweeper before it expires a booking, so a customer
+ * who paid is not handed an expired booking because a webhook was late.
+ */
+async function reconcileBooking({ booking, bookingId, userId = null }) {
+  const current = booking || (await bookingRepository.findByIdUnscoped(bookingId));
+  if (!current) throw notFound('That booking could not be found', 'BOOKING_NOT_FOUND');
+  const serialize = (row) => bookingService.serializeBooking(row);
 
-  const payment = await paymentRepository.findOpenForBooking(bookingId);
-  if (!payment || !payment.provider_order_id) {
-    return { reconciled: false, reason: 'no_order', booking: bookingService.serializeBooking(booking) };
+  if (current.status !== 'PENDING_PAYMENT') {
+    return { reconciled: false, reason: 'not_pending', booking: serialize(current) };
   }
   if (!provider.isConfigured()) {
-    return { reconciled: false, reason: 'provider_unavailable', booking: bookingService.serializeBooking(booking) };
+    return { reconciled: false, reason: 'provider_unavailable', booking: serialize(current) };
   }
 
-  // Ask about the payment we know of. Without a provider payment id there is
-  // nothing to ask about, and inventing one is not an option.
-  if (!payment.provider_payment_id) {
-    return { reconciled: false, reason: 'no_payment_attempt', booking: bookingService.serializeBooking(booking) };
+  const orders = await paymentRepository.listUnpaidOrdersForBooking(current.id);
+  if (orders.length === 0) {
+    return { reconciled: false, reason: 'no_order', booking: serialize(current) };
   }
 
-  const remote = await provider.fetchPayment(payment.provider_payment_id);
+  for (const payment of orders) {
+    const attempts = await provider.fetchOrderPayments(payment.provider_order_id);
+    // Amount checked against our order, not taken from the gateway response.
+    const captured = attempts.find(
+      (attempt) => attempt.captured && Number(attempt.amount) === Number(payment.amount_paise)
+    );
+    if (!captured) continue;
 
-  if (remote.status === 'captured' && Number(remote.amount) === Number(payment.amount_paise)) {
     const result = await settle({
       payment,
-      providerPaymentId: remote.id,
+      providerPaymentId: captured.id,
       settledVia: 'reconciliation',
-      verifyPayload: { source: 'reconciliation', remote_status: remote.status },
+      verifyPayload: { source: 'reconciliation', remote_status: captured.status },
       userId,
     });
-    return { reconciled: true, booking: result.booking };
+    return {
+      reconciled: result.confirmed,
+      reason: result.confirmed ? null : 'refund_due',
+      refund_due: result.refund_due,
+      booking: result.booking,
+    };
   }
 
-  if (remote.status === 'failed') {
-    await paymentRepository.markFailed({
-      paymentId: payment.id,
-      reason: remote.error_description || 'payment_failed',
-      payload: { source: 'reconciliation' },
-      settledVia: 'reconciliation',
-    });
-  }
-
-  const current = await bookingRepository.findByIdForUser({ bookingId, userId });
-  return {
-    reconciled: false,
-    reason: `provider_status_${remote.status}`,
-    booking: bookingService.serializeBooking(current),
-  };
+  const latest = await bookingRepository.findByIdUnscoped(current.id);
+  return { reconciled: false, reason: 'not_captured', booking: serialize(latest) };
 }
 
 /* ── status ────────────────────────────────────────────────────────────────── */
@@ -671,6 +735,7 @@ module.exports = {
   recordClientFailure,
   handleWebhook,
   reconcile,
+  reconcileBooking,
   getStatus,
   dispatchPendingRefunds,
   isConfigured: provider.isConfigured,

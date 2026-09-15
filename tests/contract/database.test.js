@@ -259,3 +259,29 @@ test('isOpenForWindow honours opening hours, 24/7 and the no-schedule fallback',
   });
   assert.equal(closed.open, false, 'a window outside every schedule must read as closed');
 });
+
+test('the operator dashboard day starts at local midnight whatever the session time zone', { skip }, async () => {
+  // REGRESSION: date_trunc on a timestamptz follows the session time zone. On a
+  // cluster whose default zone was Asia/Kolkata the lot's "today" began at 18:30
+  // IST, and revenue, check-ins and completions dropped to zero each evening.
+  const operatorRepository = require('../../src/repositories/operatorRepository');
+  const fixture = await db.withTransaction(seedLot);
+
+  const startIn = (zone) =>
+    db.withTransaction(async (tx) => {
+      await db.query(`SET LOCAL TIME ZONE '${zone}'`, [], tx);
+      const row = await operatorRepository.dashboardSummary({ parkingAreaId: fixture.areaId, client: tx });
+      return new Date(row.day_started_at).getTime();
+    });
+
+  const utc = await startIn('UTC');
+  const ist = await startIn('Asia/Kolkata');
+  const ny = await startIn('America/New_York');
+  assert.equal(ist, utc, 'the session zone must not move the start of the day');
+  assert.equal(ny, utc);
+
+  // The lot is +05:30: the day starts at 18:30 UTC of the previous calendar day.
+  const start = new Date(utc);
+  assert.equal(start.getUTCHours() * 60 + start.getUTCMinutes(), 18 * 60 + 30);
+  assert.ok(Date.now() - utc < 24 * 3600_000 && Date.now() >= utc, 'and it is the current local day');
+});

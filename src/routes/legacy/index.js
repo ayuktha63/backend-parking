@@ -231,6 +231,43 @@ router.post('/owner/parking_areas', express.json(), async (req, res, next) => {
   }
 });
 
+/**
+ * Booking and payment endpoints are RETIRED, not preserved.
+ *
+ * `POST /bookings` confirmed a booking for any non-empty `payment_id` — no order, no
+ * signature, no authentication — so before migration 0008 anyone could book for
+ * free. `/bookings/cancel` and `/owner/bookings/complete` ended in
+ * `DELETE FROM bookings`. On a schema past 0008 every one of them fails before it
+ * writes (renamed columns, the read-only booking_history), answering with a 500
+ * that echoes the SQL error. Nothing here still worked; what remained was a second,
+ * unsafe booking system beside /api/v1, which is now the only one.
+ *
+ * Old app builds reach these after taking a payment client-side. A clear 410 is the
+ * honest answer; the fix for those customers is the gateway dashboard (orders
+ * required) and an app update, not accepting an unverified payment id.
+ */
+const RETIRED_BOOKING_ROUTES = [
+  ['post', '/bookings'],
+  ['post', '/owner/bookings'],
+  ['post', '/bookings/verify'],
+  ['post', '/owner/bookings/verify'],
+  ['post', '/bookings/cancel'],
+  ['post', '/owner/bookings/complete'],
+  ['post', '/holds'],
+  ['delete', '/holds'],
+];
+
+for (const [method, path] of RETIRED_BOOKING_ROUTES) {
+  router[method](path, (req, res) => {
+    logger.warn({ path: req.path, method: req.method }, 'Blocked call to a retired legacy booking endpoint');
+    // Legacy error shape, because shipped clients parse `message`.
+    res.status(410).json({
+      message: 'This version of PARQX can no longer make or change bookings. Please update the app.',
+      code: 'ENDPOINT_RETIRED',
+    });
+  });
+}
+
 /* ── 3. the preserved original ─────────────────────────────────────────────── */
 
 // eslint-disable-next-line global-require

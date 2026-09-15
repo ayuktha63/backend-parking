@@ -94,9 +94,43 @@ async function sweepExpiredHolds() {
  * Expires bookings that were never paid for.
  *
  * Status transition plus an audit event — never a delete.
+ *
+ * "Never paid for" is checked with the gateway first. A webhook can be late, or
+ * missing from a deployment altogether, and a customer who paid must not come
+ * back to an expired booking. The gateway calls happen before the transaction,
+ * never inside it; the expiring UPDATE re-checks the status, so a booking settled
+ * a moment ago is simply not selected.
  */
 async function sweepUnpaidBookings() {
   const seconds = config.booking.pendingPaymentSeconds;
+  // eslint-disable-next-line global-require
+  const paymentService = require('../services/paymentService');
+  // eslint-disable-next-line global-require
+  const paymentRepository = require('../repositories/paymentRepository');
+
+  if (paymentService.isConfigured()) {
+    const withOrders = await db.queryMany(
+      `SELECT DISTINCT b.id
+         FROM bookings b
+         JOIN payments p ON p.booking_id = b.id
+        WHERE b.status = 'PENDING_PAYMENT'
+          AND b.created_at < NOW() - ($1 || ' seconds')::interval
+          AND p.provider_order_id IS NOT NULL
+          AND p.status IN ('CREATED', 'AUTHORIZED', 'FAILED')
+        LIMIT 50`,
+      [seconds]
+    );
+    for (const { id } of withOrders) {
+      try {
+        const result = await paymentService.reconcileBooking({ bookingId: id });
+        if (result.reconciled) logger.info({ bookingId: id }, 'Sweeper found a captured payment; booking confirmed');
+      } catch (err) {
+        // The gateway being unreachable must not keep a slot locked forever. If the
+        // money did move, the late webhook still records the refund owed.
+        logger.warn({ err: { message: err?.message }, bookingId: id }, 'Sweeper could not reconcile; expiring as unpaid');
+      }
+    }
+  }
 
   return db.withTransaction(async (tx) => {
     const rows = await db.queryMany(
@@ -116,6 +150,8 @@ async function sweepUnpaidBookings() {
         [row.id, JSON.stringify({ reason: 'payment_not_completed', after_seconds: seconds })],
         tx
       );
+      // An expired booking keeps no open order: nothing should offer to pay it.
+      await paymentRepository.abandonOpenOrders({ bookingId: row.id, reason: 'booking_expired' }, tx);
     }
 
     // Emitted after the transaction would be more correct, but these are advisory

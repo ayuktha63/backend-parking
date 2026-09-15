@@ -160,6 +160,12 @@ function serializeBooking(row, { now = time.nowUtc() } = {}) {
       // The provider's own reference, for the customer's records and for support.
       reference: row.payment_reference ?? null,
       verified_at: row.payment_verified_at ? time.toIso(row.payment_verified_at) : null,
+      // When an unpaid booking is released. The same rule the sweeper applies, so
+      // the app can say "held until 5:28 PM" instead of "for a short time".
+      due_at:
+        status === 'PENDING_PAYMENT' && row.created_at
+          ? time.toIso(time.addSeconds(time.parseInstant(row.created_at), config.booking.pendingPaymentSeconds))
+          : null,
     },
 
     // Server-decided capabilities. The client enables a button when the server

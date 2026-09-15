@@ -39,7 +39,14 @@ const verify = asyncHandler(async (req, res) => {
 
   res.json({
     data: result.booking,
-    meta: { verified: result.verified, already_settled: result.already_settled },
+    meta: {
+      verified: result.verified,
+      already_settled: result.already_settled,
+      // A verified payment does not always buy the booking: one captured after the
+      // booking expired is owed back. The client reads the booking's status.
+      confirmed: result.confirmed,
+      refund_due: result.refund_due,
+    },
   });
 });
 
@@ -83,7 +90,10 @@ const reconcile = asyncHandler(async (req, res) => {
     userId: req.auth.id,
     bookingId: req.params.bookingId,
   });
-  res.json({ data: result.booking, meta: { reconciled: result.reconciled, reason: result.reason } });
+  res.json({
+    data: result.booking,
+    meta: { reconciled: result.reconciled, reason: result.reason, refund_due: Boolean(result.refund_due) },
+  });
 });
 
 /**

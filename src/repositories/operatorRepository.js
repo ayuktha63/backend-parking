@@ -37,10 +37,17 @@ async function dashboardSummary({ parkingAreaId, arrivalWindowMinutes = 30, clie
      day AS (
        SELECT
          -- Midnight local, expressed as an instant.
-         date_trunc(
-           'day',
-           NOW() + ((SELECT timezone_offset_minutes FROM area) || ' minutes')::interval
-         ) - ((SELECT timezone_offset_minutes FROM area) || ' minutes')::interval AS started_at
+         -- Computed on UTC wall-clock time and converted back explicitly.
+         -- date_trunc on a timestamptz truncates in the SESSION time zone, so on a
+         -- database whose default zone is not UTC (a cluster initialised on a
+         -- laptop in IST, say) "today" began at 18:30 local and the dashboard's
+         -- takings reset to zero every evening.
+         (
+           date_trunc(
+             'day',
+             (NOW() AT TIME ZONE 'UTC') + ((SELECT timezone_offset_minutes FROM area) || ' minutes')::interval
+           ) - ((SELECT timezone_offset_minutes FROM area) || ' minutes')::interval
+         ) AT TIME ZONE 'UTC' AS started_at
      ),
      slots AS (
        SELECT

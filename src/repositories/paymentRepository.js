@@ -108,13 +108,39 @@ async function lockById(paymentId, client) {
 /* ── settlement ────────────────────────────────────────────────────────────── */
 
 /**
+ * Every order for a booking that has not been paid, newest first — including ones
+ * recorded as FAILED or abandoned.
+ *
+ * Our FAILED says an attempt did not complete from where we stood; it does not
+ * close the order at the gateway. A declined card retried on the same order, or a
+ * UPI collect approved after the sheet was closed, still captures money against it.
+ */
+async function listUnpaidOrdersForBooking(bookingId, client = null) {
+  return db.queryMany(
+    `SELECT ${PAYMENT_COLUMNS} FROM payments
+      WHERE booking_id = $1
+        AND provider_order_id IS NOT NULL
+        AND status IN ('CREATED', 'AUTHORIZED', 'FAILED')
+      ORDER BY created_at DESC`,
+    [bookingId],
+    client
+  );
+}
+
+/**
  * Marks a payment PAID — the only place that does.
  *
- * Conditional on `settled_at IS NULL`, so this is idempotent by construction: the
- * second caller (webhook or client callback, whichever loses the race) gets null
- * back and knows to treat the payment as already settled rather than settling it
- * again. That is the difference between "duplicate callback handled" and
- * "customer's booking confirmed twice".
+ * Conditional on the payment not already being PAID (or refunded), so it is
+ * idempotent by construction: the second caller (webhook or client callback,
+ * whichever loses the race) gets null back and knows to treat the payment as
+ * already settled rather than settling it again. That is the difference between
+ * "duplicate callback handled" and "customer's booking confirmed twice".
+ *
+ * A FAILED payment can still become PAID. Only verified captures reach this —
+ * a checkout signature, a signed webhook, or the gateway's own answer — and money
+ * the gateway captured is money received, whatever an earlier attempt reported.
+ * Conditioning on `settled_at IS NULL` instead stranded exactly those payments:
+ * charged, and the booking never confirmed.
  */
 async function markPaid(
   { paymentId, providerPaymentId, signature, verifyPayload, settledVia },
@@ -132,8 +158,7 @@ async function markPaid(
             failure_reason      = NULL,
             updated_at          = NOW()
       WHERE id = $1
-        AND settled_at IS NULL
-        AND status IN ('CREATED', 'AUTHORIZED')
+        AND status IN ('CREATED', 'AUTHORIZED', 'FAILED')
       RETURNING ${PAYMENT_COLUMNS}`,
     [paymentId, providerPaymentId, signature, JSON.stringify(verifyPayload || {}), settledVia],
     client
@@ -267,6 +292,16 @@ async function addRefundedAmount({ paymentId, amountPaise }, client = null) {
   );
 }
 
+/** The refund already owed on one payment, if any. */
+async function findRefundForPayment(paymentId, client = null) {
+  return db.queryOne(
+    `SELECT id, payment_id, booking_id, amount_paise, reason, status, created_at
+       FROM refunds WHERE payment_id = $1 ORDER BY created_at DESC LIMIT 1`,
+    [paymentId],
+    client
+  );
+}
+
 async function listRefundsForBooking(bookingId, client = null) {
   return db.queryMany(
     `SELECT id, amount_paise, reason, status, provider_refund_id, processed_at, created_at
@@ -283,6 +318,7 @@ module.exports = {
   findByProviderOrderId,
   findByProviderPaymentId,
   findPaidForBooking,
+  listUnpaidOrdersForBooking,
   lockById,
   markPaid,
   markFailed,
@@ -292,5 +328,6 @@ module.exports = {
   createRefund,
   markRefundProcessed,
   addRefundedAmount,
+  findRefundForPayment,
   listRefundsForBooking,
 };

@@ -156,6 +156,33 @@ async function fetchPayment(providerPaymentId) {
   }
 }
 
+/**
+ * Every payment attempt made against an order.
+ *
+ * The reconciliation path when the server never learned a payment id: the app was
+ * killed mid-checkout, or the customer finished in an external wallet. An order
+ * can carry several attempts — declined, then retried — so the caller looks for a
+ * captured one rather than trusting the first.
+ */
+async function fetchOrderPayments(providerOrderId) {
+  const api = getClient();
+  try {
+    const result = await api.orders.fetchPayments(providerOrderId);
+    return (result?.items || []).map((payment) => ({
+      id: payment.id,
+      order_id: payment.order_id,
+      status: payment.status,
+      amount: Number(payment.amount),
+      currency: payment.currency,
+      method: payment.method,
+      captured: payment.captured === true || payment.status === 'captured',
+    }));
+  } catch (err) {
+    logger.error({ err: { message: err?.message } }, 'Provider order payments fetch failed');
+    throw serviceUnavailable('We could not check that payment. Please try again.');
+  }
+}
+
 /** Issues a refund. Only called when FEATURE_REFUNDS_ENABLED is on. */
 async function createRefund({ providerPaymentId, amountPaise, notes = {} }) {
   const api = getClient();
@@ -178,6 +205,7 @@ module.exports = {
   verifyCheckoutSignature,
   verifyWebhookSignature,
   fetchPayment,
+  fetchOrderPayments,
   createRefund,
   // The key id is public — it is embedded in the checkout page. The secret is not
   // and never leaves this module.
