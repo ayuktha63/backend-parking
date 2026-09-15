@@ -37,7 +37,7 @@
  */
 
 const { config } = require('../config');
-const photos = require('./parkingPhotoService');
+const photos = require('../utils/publicUrl');
 const db = require('../db');
 const bookingRepository = require('../repositories/bookingRepository');
 const paymentRepository = require('../repositories/paymentRepository');

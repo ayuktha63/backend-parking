@@ -86,7 +86,14 @@ function attach(httpServer) {
     try {
       const claims = verifyAccessToken(token);
       socket.data.auth = { id: Number(claims.sub), role: claims.role, phone: claims.phone };
-    } catch {
+    } catch (err) {
+      // Still admitted (the slot map is public), but without private rooms. Logged
+      // because the symptom — booking events silently not arriving — is otherwise
+      // invisible from both ends.
+      logger.warn(
+        { socketId: socket.id, reason: err?.name || 'invalid_token' },
+        'Socket token rejected; connected without a user room'
+      );
       socket.data.auth = null;
     }
     return next();

@@ -38,7 +38,6 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 
 const db = require('../db');
-const { config } = require('../config');
 const operatorService = require('./operatorService');
 const operatorRepository = require('../repositories/operatorRepository');
 const gateway = require('../sockets/gateway');
@@ -156,12 +155,7 @@ function present(row) {
  * host changes. Clients are given a fully-qualified URL because a Flutter
  * `Image.network` has no base to resolve against.
  */
-function absolute(url) {
-  if (!url) return null;
-  if (/^https?:\/\//i.test(url)) return url;
-  const base = (config.publicBaseUrl || '').replace(/\/+$/, '');
-  return base ? `${base}${url}` : url;
-}
+const { absolute } = require('../utils/publicUrl');
 
 /* ── mutations ─────────────────────────────────────────────────────────────── */
 
